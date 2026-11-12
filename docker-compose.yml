@@ -1,0 +1,18 @@
+# Optional: local PostgreSQL for development (requires Docker Desktop).
+# If you use Neon or a local PostgreSQL install, you do not need this file.
+services:
+  postgres:
+    image: postgres:16
+    container_name: prop-postgres
+    restart: unless-stopped
+    environment:
+      POSTGRES_USER: postgres
+      POSTGRES_PASSWORD: postgres
+      POSTGRES_DB: perpetual_prop
+    ports:
+      - "5432:5432"
+    volumes:
+      - prop_pgdata:/var/lib/postgresql/data
+
+volumes:
+  prop_pgdata:

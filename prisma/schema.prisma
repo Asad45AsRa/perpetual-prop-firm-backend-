@@ -1,0 +1,475 @@
+// =====================================================================
+// Perpetual Prop Firm - database schema (PostgreSQL)
+// Rules:
+//  * All money / price / size values are Decimal, never Float.
+//  * TradingAccount.balance is a cached value. It may ONLY be changed
+//    through ledger.service.ts, which writes a LedgerEntry for every
+//    change. Never update the balance directly anywhere else.
+// =====================================================================
+
+generator client {
+  provider = "prisma-client-js"
+}
+
+datasource db {
+  provider = "postgresql"
+  url      = env("DATABASE_URL")
+}
+
+// ----------------------------- Enums ---------------------------------
+
+enum Role {
+  USER
+  MODERATOR
+  ADMIN
+  SUPER_ADMIN
+}
+
+enum EmailTokenType {
+  VERIFY_EMAIL
+  PASSWORD_RESET
+}
+
+enum AccountStage {
+  CHALLENGE
+  FUNDED
+}
+
+enum AccountStatus {
+  ACTIVE
+  PASSED
+  BREACHED
+  DISABLED
+}
+
+enum DailyLossMethod {
+  BALANCE_BASED
+  EQUITY_BASED
+}
+
+enum DrawdownType {
+  STATIC
+  TRAILING
+}
+
+enum PurchaseStatus {
+  PENDING
+  PAID
+  EXPIRED
+  FAILED
+  NEEDS_REVIEW
+}
+
+enum OrderSide {
+  BUY
+  SELL
+}
+
+enum OrderType {
+  MARKET
+  LIMIT
+}
+
+enum OrderStatus {
+  NEW
+  FILLED
+  CANCELED
+  REJECTED
+}
+
+enum PositionSide {
+  LONG
+  SHORT
+}
+
+enum PositionStatus {
+  OPEN
+  CLOSED
+}
+
+enum LedgerType {
+  DEPOSIT
+  REALIZED_PNL
+  FEE
+  FUNDING
+  PAYOUT
+  ADJUSTMENT
+}
+
+enum RiskEventType {
+  DAILY_LOSS_BREACH
+  MAX_DRAWDOWN_BREACH
+  PROFIT_TARGET_REACHED
+  LIQUIDATION
+  STALE_PRICE_BLOCK
+  MANUAL_LOCK
+}
+
+enum PayoutStatus {
+  REQUESTED
+  APPROVED
+  REJECTED
+  SENT
+  CONFIRMED
+  FAILED
+}
+
+enum CommissionStatus {
+  PENDING
+  APPROVED
+  PAID
+  REJECTED
+}
+
+// ------------------------------ Users --------------------------------
+
+model User {
+  id              String    @id @default(uuid()) @db.Uuid
+  email           String    @unique
+  passwordHash    String
+  role            Role      @default(USER)
+  isActive        Boolean   @default(true)
+  // The first super admin is protected: nobody can delete or demote it.
+  isProtected     Boolean   @default(false)
+  emailVerified   Boolean   @default(false)
+  emailVerifiedAt DateTime?
+  mfaEnabled      Boolean   @default(false)
+  // AES-GCM encrypted TOTP secret (see utils/encryption.ts)
+  mfaSecret       String?
+  referralCode    String    @unique
+  referredById    String?   @db.Uuid
+  referredBy      User?     @relation("Referrals", fields: [referredById], references: [id])
+  referrals       User[]    @relation("Referrals")
+  createdAt       DateTime  @default(now())
+  updatedAt       DateTime  @updatedAt
+  deletedAt       DateTime?
+
+  permissions    StaffPermission[]
+  emailTokens    EmailToken[]
+  refreshTokens  RefreshToken[]
+  purchases      Purchase[]
+  accounts       TradingAccount[]
+  payouts        Payout[]
+  commissions    Commission[]     @relation("AffiliateCommissions")
+  auditLogs      AuditLog[]
+
+  @@index([role])
+}
+
+// Section-by-section access for ADMIN and MODERATOR users.
+// SUPER_ADMIN always has access to everything.
+model StaffPermission {
+  id      String @id @default(uuid()) @db.Uuid
+  userId  String @db.Uuid
+  user    User   @relation(fields: [userId], references: [id], onDelete: Cascade)
+  section String
+
+  @@unique([userId, section])
+}
+
+model EmailToken {
+  id        String         @id @default(uuid()) @db.Uuid
+  userId    String         @db.Uuid
+  user      User           @relation(fields: [userId], references: [id], onDelete: Cascade)
+  type      EmailTokenType
+  tokenHash String         @unique
+  expiresAt DateTime
+  usedAt    DateTime?
+  createdAt DateTime       @default(now())
+
+  @@index([userId, type])
+}
+
+model RefreshToken {
+  id          String    @id @default(uuid()) @db.Uuid
+  userId      String    @db.Uuid
+  user        User      @relation(fields: [userId], references: [id], onDelete: Cascade)
+  tokenHash   String    @unique
+  // Remembers whether this session passed MFA (staff accounts)
+  mfaVerified Boolean   @default(false)
+  expiresAt   DateTime
+  revokedAt   DateTime?
+  createdAt   DateTime  @default(now())
+
+  @@index([userId])
+}
+
+// ------------------------- Plans & purchases -------------------------
+
+model Plan {
+  id               String          @id @default(uuid()) @db.Uuid
+  name             String
+  accountSize      Decimal         @db.Decimal(20, 8)
+  price            Decimal         @db.Decimal(20, 8)
+  // All percentages are stored as plain numbers: 10 means 10 percent
+  profitTargetPct  Decimal         @db.Decimal(10, 4)
+  dailyLossPct     Decimal         @db.Decimal(10, 4)
+  maxDrawdownPct   Decimal         @db.Decimal(10, 4)
+  maxLeverage      Int             @default(20)
+  minTradingDays   Int             @default(0)
+  // Calculation methods must be confirmed with the client
+  dailyLossMethod  DailyLossMethod @default(BALANCE_BASED)
+  drawdownType     DrawdownType    @default(STATIC)
+  isActive         Boolean         @default(true)
+  createdAt        DateTime        @default(now())
+  updatedAt        DateTime        @updatedAt
+
+  purchases Purchase[]
+  accounts  TradingAccount[]
+}
+
+model Purchase {
+  id                String         @id @default(uuid()) @db.Uuid
+  userId            String         @db.Uuid
+  user              User           @relation(fields: [userId], references: [id])
+  planId            String         @db.Uuid
+  plan              Plan           @relation(fields: [planId], references: [id])
+  amount            Decimal        @db.Decimal(20, 8)
+  currency          String         @default("USD")
+  status            PurchaseStatus @default(PENDING)
+  // Plisio invoice reference. Unique so one invoice maps to one purchase.
+  plisioTxnId       String?        @unique
+  plisioInvoiceUrl  String?
+  paidAt            DateTime?
+  createdAt         DateTime       @default(now())
+  updatedAt         DateTime       @updatedAt
+
+  // One purchase can create at most ONE trading account (unique FK below)
+  tradingAccount TradingAccount?
+  commission     Commission?
+
+  @@index([userId])
+  @@index([status, createdAt])
+}
+
+// --------------------------- Trading accounts ------------------------
+
+model TradingAccount {
+  id               String        @id @default(uuid()) @db.Uuid
+  userId           String        @db.Uuid
+  user             User          @relation(fields: [userId], references: [id])
+  planId           String        @db.Uuid
+  plan             Plan          @relation(fields: [planId], references: [id])
+  // The purchase that created this account. Unique = no duplicate activation.
+  purchaseId       String?       @unique @db.Uuid
+  purchase         Purchase?     @relation(fields: [purchaseId], references: [id])
+  // Funded accounts point back to the challenge account that created them
+  sourceAccountId  String?       @db.Uuid
+  stage            AccountStage  @default(CHALLENGE)
+  status           AccountStatus @default(ACTIVE)
+  startingBalance  Decimal       @db.Decimal(20, 8)
+  // Cached balance. Only ledger.service.ts may change it.
+  balance          Decimal       @default(0) @db.Decimal(20, 8)
+  highWaterMark    Decimal       @default(0) @db.Decimal(20, 8)
+  dayStartEquity   Decimal       @default(0) @db.Decimal(20, 8)
+  dayStartBalance  Decimal       @default(0) @db.Decimal(20, 8)
+  lastDailyResetAt DateTime?
+  statusReason     String?
+  createdAt        DateTime      @default(now())
+  updatedAt        DateTime      @updatedAt
+
+  orders        Order[]
+  fills         Fill[]
+  positions     Position[]
+  ledgerEntries LedgerEntry[]
+  riskEvents    RiskEvent[]
+  payouts       Payout[]
+
+  @@index([userId])
+  @@index([status])
+}
+
+model Market {
+  id             String   @id @default(uuid()) @db.Uuid
+  symbol         String   @unique
+  baseAsset      String
+  // Size decimals from Hyperliquid metadata
+  szDecimals     Int
+  // Price decimals allowed for this market (6 - szDecimals for perps)
+  pricePrecision Int
+  minSize        Decimal  @db.Decimal(28, 10)
+  maxLeverage    Int
+  isEnabled      Boolean  @default(false)
+  isHalted       Boolean  @default(false)
+  createdAt      DateTime @default(now())
+  updatedAt      DateTime @updatedAt
+
+  orders    Order[]
+  fills     Fill[]
+  positions Position[]
+}
+
+model Order {
+  id            String      @id @default(uuid()) @db.Uuid
+  accountId     String      @db.Uuid
+  account       TradingAccount @relation(fields: [accountId], references: [id])
+  marketId      String      @db.Uuid
+  market        Market      @relation(fields: [marketId], references: [id])
+  // Client supplied key. Prevents duplicate orders on retries.
+  clientOrderId String?
+  side          OrderSide
+  type          OrderType   @default(MARKET)
+  status        OrderStatus @default(NEW)
+  size          Decimal     @db.Decimal(28, 10)
+  limitPrice    Decimal?    @db.Decimal(28, 10)
+  filledSize    Decimal     @default(0) @db.Decimal(28, 10)
+  avgFillPrice  Decimal?    @db.Decimal(28, 10)
+  leverage      Int
+  reduceOnly    Boolean     @default(false)
+  rejectReason  String?
+  createdAt     DateTime    @default(now())
+  updatedAt     DateTime    @updatedAt
+
+  fills Fill[]
+
+  @@unique([accountId, clientOrderId])
+  @@index([accountId, createdAt])
+}
+
+model Fill {
+  id          String    @id @default(uuid()) @db.Uuid
+  orderId     String    @db.Uuid
+  order       Order     @relation(fields: [orderId], references: [id])
+  accountId   String    @db.Uuid
+  account     TradingAccount @relation(fields: [accountId], references: [id])
+  marketId    String    @db.Uuid
+  market      Market    @relation(fields: [marketId], references: [id])
+  side        OrderSide
+  price       Decimal   @db.Decimal(28, 10)
+  size        Decimal   @db.Decimal(28, 10)
+  fee         Decimal   @db.Decimal(20, 8)
+  realizedPnl Decimal   @default(0) @db.Decimal(20, 8)
+  createdAt   DateTime  @default(now())
+
+  @@index([accountId, createdAt])
+}
+
+// Netting mode: one row per account + market. A closed position keeps
+// its row with size 0 and status CLOSED, and is reused when reopened.
+model Position {
+  id               String         @id @default(uuid()) @db.Uuid
+  accountId        String         @db.Uuid
+  account          TradingAccount @relation(fields: [accountId], references: [id])
+  marketId         String         @db.Uuid
+  market           Market         @relation(fields: [marketId], references: [id])
+  side             PositionSide
+  size             Decimal        @default(0) @db.Decimal(28, 10)
+  entryPrice       Decimal        @default(0) @db.Decimal(28, 10)
+  markPrice        Decimal        @default(0) @db.Decimal(28, 10)
+  leverage         Int            @default(1)
+  margin           Decimal        @default(0) @db.Decimal(20, 8)
+  liquidationPrice Decimal?       @db.Decimal(28, 10)
+  status           PositionStatus @default(OPEN)
+  openedAt         DateTime       @default(now())
+  updatedAt        DateTime       @updatedAt
+
+  @@unique([accountId, marketId])
+  @@index([status])
+}
+
+// Append-only. Every balance change of a trading account is one row.
+model LedgerEntry {
+  id             String         @id @default(uuid()) @db.Uuid
+  accountId      String         @db.Uuid
+  account        TradingAccount @relation(fields: [accountId], references: [id])
+  type           LedgerType
+  // Signed amount: positive credits the account, negative debits it
+  amount         Decimal        @db.Decimal(20, 8)
+  balanceAfter   Decimal        @db.Decimal(20, 8)
+  refType        String?
+  refId          String?
+  // Makes retries safe: the same key can never be posted twice
+  idempotencyKey String?        @unique
+  description    String?
+  createdAt      DateTime       @default(now())
+
+  @@index([accountId, createdAt])
+}
+
+model RiskEvent {
+  id        String         @id @default(uuid()) @db.Uuid
+  accountId String         @db.Uuid
+  account   TradingAccount @relation(fields: [accountId], references: [id])
+  type      RiskEventType
+  details   Json?
+  createdAt DateTime       @default(now())
+
+  @@index([accountId, createdAt])
+  @@index([type])
+}
+
+// ------------------------ Payouts & affiliates -----------------------
+
+model Payout {
+  id            String       @id @default(uuid()) @db.Uuid
+  userId        String       @db.Uuid
+  user          User         @relation(fields: [userId], references: [id])
+  accountId     String       @db.Uuid
+  account       TradingAccount @relation(fields: [accountId], references: [id])
+  amount        Decimal      @db.Decimal(20, 8)
+  asset         String
+  network       String
+  walletAddress String
+  status        PayoutStatus @default(REQUESTED)
+  txHash        String?
+  explorerUrl   String?
+  reviewedById  String?      @db.Uuid
+  reviewedAt    DateTime?
+  rejectReason  String?
+  createdAt     DateTime     @default(now())
+  updatedAt     DateTime     @updatedAt
+
+  @@index([status, createdAt])
+  @@index([userId])
+}
+
+model Commission {
+  id              String           @id @default(uuid()) @db.Uuid
+  affiliateUserId String           @db.Uuid
+  affiliate       User             @relation("AffiliateCommissions", fields: [affiliateUserId], references: [id])
+  // Unique: one commission per purchase
+  purchaseId      String           @unique @db.Uuid
+  purchase        Purchase         @relation(fields: [purchaseId], references: [id])
+  amount          Decimal          @db.Decimal(20, 8)
+  status          CommissionStatus @default(PENDING)
+  createdAt       DateTime         @default(now())
+
+  @@index([affiliateUserId])
+}
+
+// ------------------------- Platform & content ------------------------
+
+model AuditLog {
+  id        String   @id @default(uuid()) @db.Uuid
+  actorId   String?  @db.Uuid
+  actor     User?    @relation(fields: [actorId], references: [id])
+  action    String
+  entity    String?
+  entityId  String?
+  metadata  Json?
+  ip        String?
+  createdAt DateTime @default(now())
+
+  @@index([actorId])
+  @@index([entity, entityId])
+  @@index([createdAt])
+}
+
+// Editable content shown on the public site (for example faq and rules)
+model ContentBlock {
+  id          String   @id @default(uuid()) @db.Uuid
+  key         String   @unique
+  title       String?
+  data        Json
+  updatedById String?  @db.Uuid
+  updatedAt   DateTime @updatedAt
+  createdAt   DateTime @default(now())
+}
+
+// Business values that must be configurable, not hard coded
+// (fees, spread, payout rules, affiliate commission, and so on)
+model PlatformSetting {
+  key       String   @id
+  value     Json
+  updatedAt DateTime @updatedAt
+}
