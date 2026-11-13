@@ -27,6 +27,15 @@ const schema = z.object({
   MFA_ENCRYPTION_KEY: z.string().regex(/^[0-9a-fA-F]{64}$/, 'must be 64 hex characters'),
   MFA_ISSUER: z.string().default('PerpetualPropFirm'),
 
+  // Session cookies. Frontend and API on different sites (e.g. vercel.app + onrender.com) need
+  // COOKIE_SAMESITE=none and COOKIE_SECURE=true. Same site (or localhost) works with lax.
+  COOKIE_SAMESITE: z.enum(['lax', 'strict', 'none']).default('lax'),
+  COOKIE_SECURE: z.enum(['true', 'false']).optional(),
+  COOKIE_DOMAIN: z.string().optional(),
+
+  // Google sign-in (Google Identity Services client id). Empty = Google sign-in disabled.
+  GOOGLE_CLIENT_ID: z.string().optional().default(''),
+
   FRONTEND_URL: z.string().url(),
   CORS_ORIGINS: z.string().default('http://localhost:3000'),
 

@@ -25,6 +25,18 @@ enum Role {
   SUPER_ADMIN
 }
 
+// Which end-user dashboards a USER can open. One person can be both a trader and an affiliate.
+enum Portal {
+  TRADER
+  AFFILIATE
+}
+
+// Per-section admin access (frontend: none / view / manage; "none" = no row).
+enum AccessLevel {
+  VIEW
+  MANAGE
+}
+
 enum EmailTokenType {
   VERIFY_EMAIL
   PASSWORD_RESET
@@ -126,8 +138,30 @@ enum CommissionStatus {
 model User {
   id              String    @id @default(uuid()) @db.Uuid
   email           String    @unique
-  passwordHash    String
+  // Staff only. Customers sign in with an email code or Google (no password).
+  passwordHash    String?
+  // Customer profile (onboarding username + avatar steps, Settings page)
+  username        String?   @unique
+  avatar          String?
+  leaderboardPublic Boolean @default(true)
+  // Staff display name (Staff & Permissions page)
+  displayName     String?
+  // Affiliate join: where the affiliate promotes (Instagram / Meta / TikTok) and their handle there
+  signupPlatform  String?
+  signupHandle    String?
+  // Google sign-in subject (stable Google account id)
+  googleSub       String?   @unique
+  lastLoginAt     DateTime?
+  // Any access token issued before this moment is rejected (force sign-out, suspend, role change).
+  tokensValidAfter DateTime?
+  // Optimistic locking for staff edits (409 when two admins edit at once)
+  version         Int       @default(1)
+  createdByEmail  String?
   role            Role      @default(USER)
+  // End-user portals (ignored for staff). Signing up gives TRADER; joining the affiliate program adds AFFILIATE.
+  portals         Portal[]  @default([TRADER])
+  // Set when an admin edits portals by hand: sign-in flows then stop auto-adding portals.
+  portalsManagedByAdmin Boolean @default(false)
   isActive        Boolean   @default(true)
   // The first super admin is protected: nobody can delete or demote it.
   isProtected     Boolean   @default(false)
@@ -145,6 +179,7 @@ model User {
   deletedAt       DateTime?
 
   permissions    StaffPermission[]
+  rights         StaffRight[]
   emailTokens    EmailToken[]
   refreshTokens  RefreshToken[]
   purchases      Purchase[]
@@ -156,15 +191,42 @@ model User {
   @@index([role])
 }
 
-// Section-by-section access for ADMIN and MODERATOR users.
-// SUPER_ADMIN always has access to everything.
+// Section-by-section access for ADMIN and MODERATOR users (section keys = admin sidebar pages,
+// see src/modules/rbac/rbac.catalog.ts). SUPER_ADMIN always has MANAGE on everything.
 model StaffPermission {
-  id      String @id @default(uuid()) @db.Uuid
-  userId  String @db.Uuid
-  user    User   @relation(fields: [userId], references: [id], onDelete: Cascade)
+  id      String      @id @default(uuid()) @db.Uuid
+  userId  String      @db.Uuid
+  user    User        @relation(fields: [userId], references: [id], onDelete: Cascade)
   section String
+  level   AccessLevel @default(VIEW)
 
   @@unique([userId, section])
+}
+
+// Special rights for sensitive actions (approve payouts, kill switches...). Granted one by one,
+// independent of section level, so MANAGE on a page never silently allows moving money.
+model StaffRight {
+  id     String @id @default(uuid()) @db.Uuid
+  userId String @db.Uuid
+  user   User   @relation(fields: [userId], references: [id], onDelete: Cascade)
+  right  String
+
+  @@unique([userId, right])
+}
+
+// Passwordless sign-in: 6-digit code emailed to the address. Stored hashed; max 5 attempts.
+// "meta" keeps what the sign-up form sent (portal, referral, platform, handle) until the code is confirmed.
+model LoginCode {
+  id        String    @id @default(uuid()) @db.Uuid
+  email     String
+  codeHash  String
+  meta      Json?
+  attempts  Int       @default(0)
+  expiresAt DateTime
+  usedAt    DateTime?
+  createdAt DateTime  @default(now())
+
+  @@index([email, createdAt])
 }
 
 model EmailToken {
@@ -187,6 +249,10 @@ model RefreshToken {
   tokenHash   String    @unique
   // Remembers whether this session passed MFA (staff accounts)
   mfaVerified Boolean   @default(false)
+  // Device info for the "Active devices" list
+  userAgent   String?
+  ip          String?
+  lastUsedAt  DateTime  @default(now())
   expiresAt   DateTime
   revokedAt   DateTime?
   createdAt   DateTime  @default(now())

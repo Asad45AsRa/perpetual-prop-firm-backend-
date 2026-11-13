@@ -1,6 +1,6 @@
 import type { FastifyInstance } from 'fastify';
 import { z } from 'zod';
-import { authenticate } from '../../middleware/auth';
+import { requirePortal } from '../../middleware/auth';
 import { Decimal } from '../../utils/decimal';
 import { parse } from '../../utils/validate';
 import * as service from './payouts.service';
@@ -17,15 +17,15 @@ export async function payoutRoutes(app: FastifyInstance) {
   // Public feed shown on the website
   app.get('/public', async () => service.listPublicPayouts());
 
-  app.post('/', { preHandler: authenticate }, async (req, reply) => {
+  app.post('/', { preHandler: requirePortal('TRADER') }, async (req, reply) => {
     const body = parse(requestSchema, req.body);
     const payout = await service.requestPayout(req.user!.id, { ...body, amount: new Decimal(body.amount) });
     return reply.status(201).send(payout);
   });
 
-  app.get('/', { preHandler: authenticate }, async (req) => service.listMyPayouts(req.user!.id));
+  app.get('/', { preHandler: requirePortal('TRADER') }, async (req) => service.listMyPayouts(req.user!.id));
 
-  app.get('/eligibility/:accountId', { preHandler: authenticate }, async (req) => {
+  app.get('/eligibility/:accountId', { preHandler: requirePortal('TRADER') }, async (req) => {
     const { accountId } = req.params as { accountId: string };
     const info = await service.getPayoutEligibility(req.user!.id, accountId);
     return {

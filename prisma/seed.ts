@@ -20,6 +20,8 @@ async function main() {
         email: email.toLowerCase(),
         passwordHash: await bcrypt.hash(password, 12),
         role: 'SUPER_ADMIN',
+        displayName: 'Super Admin',
+        portals: [],
         isProtected: true,
         emailVerified: true,
         emailVerifiedAt: new Date(),

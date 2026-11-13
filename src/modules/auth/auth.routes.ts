@@ -1,62 +1,48 @@
 import type { FastifyInstance } from 'fastify';
-import { authenticate } from '../../middleware/auth';
+import { requireCustomer } from '../../middleware/auth';
 import { parse } from '../../utils/validate';
 import * as service from './auth.service';
+import { endSession } from './session';
 import {
-  forgotPasswordSchema,
-  loginSchema,
-  mfaEnableSchema,
-  mfaVerifySchema,
-  refreshSchema,
-  resetPasswordSchema,
-  signupSchema,
-  verifyEmailSchema,
+  emailResendSchema,
+  emailStartSchema,
+  emailVerifySchema,
+  googleSchema,
+  profileSchema,
+  sessionParams,
+  usernameQuerySchema,
 } from './auth.schemas';
 
 // Strict limit for endpoints attackers like to brute force
 const strictLimit = { config: { rateLimit: { max: 5, timeWindow: '1 minute' } } };
+const verifyLimit = { config: { rateLimit: { max: 10, timeWindow: '1 minute' } } };
 
+// /api/v1/auth: customer (trader + affiliate) sign-in. Session = httpOnly cookies.
 export async function authRoutes(app: FastifyInstance) {
-  app.post('/signup', strictLimit, async (req, reply) => {
-    const body = parse(signupSchema, req.body);
-    return reply.status(201).send(await service.signup(body));
+  // ----- Passwordless sign-in / sign-up -----
+  app.post('/email/start', strictLimit, async (req) => service.startEmailSignIn(parse(emailStartSchema, req.body)));
+  app.post('/email/resend', strictLimit, async (req) => service.resendEmailCode(parse(emailResendSchema, req.body).email));
+  app.post('/email/verify', verifyLimit, async (req, reply) => {
+    const body = parse(emailVerifySchema, req.body);
+    return service.verifyEmailCode(req, reply, body.email, body.code);
   });
+  app.post('/google', strictLimit, async (req, reply) => service.signInWithGoogle(req, reply, parse(googleSchema, req.body)));
 
-  app.post('/verify-email', async (req) => {
-    await service.verifyEmail(parse(verifyEmailSchema, req.body).token);
+  app.get('/username-available', async (req) => service.isUsernameAvailable(parse(usernameQuerySchema, req.query).username));
+
+  // ----- Signed in -----
+  app.get('/me', { preHandler: requireCustomer }, async (req) => service.getMe(req.user!.id));
+  app.patch('/profile', { preHandler: requireCustomer }, async (req) => service.updateProfile(req.user!.id, parse(profileSchema, req.body)));
+
+  app.post('/logout', async (req, reply) => {
+    await endSession(req, reply, 'customer');
     return { ok: true };
   });
+  app.post('/logout-all', { preHandler: requireCustomer }, async (req, reply) => service.logoutEverywhere(req, reply, req.user!.id));
 
-  app.post('/login', strictLimit, async (req) => service.login(parse(loginSchema, req.body), req.ip));
-
-  app.post('/mfa/verify', strictLimit, async (req) =>
-    service.verifyMfaLogin(parse(mfaVerifySchema, req.body), req.ip),
-  );
-
-  app.post('/refresh', async (req) => service.refresh(parse(refreshSchema, req.body).refreshToken));
-
-  app.post('/logout', async (req) => {
-    await service.logout(parse(refreshSchema, req.body).refreshToken);
-    return { ok: true };
-  });
-
-  app.post('/forgot-password', strictLimit, async (req) => {
-    await service.forgotPassword(parse(forgotPasswordSchema, req.body).email);
-    return { ok: true };
-  });
-
-  app.post('/reset-password', strictLimit, async (req) => {
-    const body = parse(resetPasswordSchema, req.body);
-    await service.resetPassword(body.token, body.password);
-    return { ok: true };
-  });
-
-  // ----- Logged in endpoints -----
-  app.get('/me', { preHandler: authenticate }, async (req) => service.getMe(req.user!.id));
-
-  app.post('/mfa/setup', { preHandler: authenticate }, async (req) => service.setupMfa(req.user!.id));
-
-  app.post('/mfa/enable', { preHandler: authenticate }, async (req) =>
-    service.enableMfa(req.user!.id, parse(mfaEnableSchema, req.body).code),
+  // Active devices (Settings / My Profile)
+  app.get('/sessions', { preHandler: requireCustomer }, async (req) => service.listSessions(req, req.user!.id));
+  app.delete('/sessions/:id', { preHandler: requireCustomer }, async (req, reply) =>
+    service.revokeSession(req, reply, req.user!.id, parse(sessionParams, req.params).id),
   );
 }

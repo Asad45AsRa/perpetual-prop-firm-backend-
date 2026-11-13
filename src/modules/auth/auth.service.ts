@@ -1,226 +1,218 @@
-import bcrypt from 'bcryptjs';
-import { authenticator } from 'otplib';
-import type { User } from '@prisma/client';
+import { createHmac, randomInt, timingSafeEqual } from 'crypto';
+import type { FastifyReply, FastifyRequest } from 'fastify';
+import type { Portal, Prisma, User } from '@prisma/client';
 import { env } from '../../config/env';
 import { prisma } from '../../config/prisma';
 import { ApiError } from '../../utils/api-error';
-import { generateReferralCode, generateToken, sha256 } from '../../utils/crypto';
-import { decrypt, encrypt } from '../../utils/encryption';
-import { hashPassword, verifyPassword } from '../../utils/password';
-import {
-  signAccessToken,
-  signMfaChallengeToken,
-  verifyMfaChallengeToken,
-} from '../../utils/tokens';
-import { STAFF_ROLES } from '../../config/constants';
+import { generateReferralCode } from '../../utils/crypto';
 import { emailTemplates, sendEmail } from '../../services/email.service';
 import { audit } from '../audit/audit.service';
+import { loadAccess } from '../rbac/rbac.service';
+import { currentSessionHash, deviceLabel, endSession, revokeAllSessions, startSession } from './session';
 
-const DAY_MS = 24 * 60 * 60 * 1000;
-const isStaff = (role: string) => (STAFF_ROLES as readonly string[]).includes(role);
+// =====================================================================
+// Customer authentication (trader + affiliate). Passwordless:
+//   1. POST /auth/email/start   -> 6-digit code by email
+//   2. POST /auth/email/verify  -> signs in (creates the account on first use)
+//   3. PATCH /auth/profile      -> username + avatar (onboarding steps 3 and 4)
+// or POST /auth/google. Staff use /admin/auth (password + 2FA).
+// =====================================================================
 
-// A real bcrypt hash of a throwaway value. Used to keep login timing the
-// same whether or not the email exists.
-const DUMMY_HASH = bcrypt.hashSync('timing-attack-protection', 12);
+const CODE_TTL_MS = 10 * 60 * 1000;
+export const RESEND_COOLDOWN_S = 60;
+const MAX_ATTEMPTS = 5;
 
-function publicUser(u: User) {
+type SignupMeta = { portal: Portal; referralCode?: string; platform?: string; handle?: string };
+
+const hashCode = (email: string, code: string) => createHmac('sha256', env.JWT_REFRESH_SECRET).update(`${email}:${code}`).digest('hex');
+
+export function publicUser(u: User) {
   return {
     id: u.id,
     email: u.email,
-    role: u.role,
-    emailVerified: u.emailVerified,
-    mfaEnabled: u.mfaEnabled,
+    username: u.username,
+    avatar: u.avatar,
+    leaderboardPublic: u.leaderboardPublic,
+    portals: u.portals,
     referralCode: u.referralCode,
+    signupPlatform: u.signupPlatform,
+    signupHandle: u.signupHandle,
+    createdAt: u.createdAt,
   };
 }
 
-// Creates an access token and a rotating refresh token.
-async function issueSession(user: User, mfaVerified: boolean) {
-  const refresh = generateToken(48);
-  await prisma.refreshToken.create({
-    data: {
-      userId: user.id,
-      tokenHash: refresh.hash,
-      mfaVerified,
-      expiresAt: new Date(Date.now() + env.REFRESH_TOKEN_TTL_DAYS * DAY_MS),
-    },
+const needsProfile = (u: User) => !u.username || !u.avatar;
+
+// ------------------------------ Email code ------------------------------
+
+async function issueCode(emailAddr: string, meta: SignupMeta) {
+  const last = await prisma.loginCode.findFirst({ where: { email: emailAddr }, orderBy: { createdAt: 'desc' } });
+  if (last && Date.now() - last.createdAt.getTime() < RESEND_COOLDOWN_S * 1000) {
+    const wait = Math.ceil(RESEND_COOLDOWN_S - (Date.now() - last.createdAt.getTime()) / 1000);
+    throw new ApiError(429, 'RESEND_COOLDOWN', `Please wait ${wait}s before requesting a new code`, { retryInSeconds: wait });
+  }
+
+  const existing = await prisma.user.findUnique({ where: { email: emailAddr } });
+  // Staff, suspended and deleted accounts never get a customer code. Same response, so emails are not revealed.
+  const allowed = !existing || (existing.role === 'USER' && existing.isActive && !existing.deletedAt);
+
+  const code = String(randomInt(0, 1_000_000)).padStart(6, '0');
+  await prisma.loginCode.create({
+    data: { email: emailAddr, codeHash: hashCode(emailAddr, code), meta: meta as unknown as Prisma.InputJsonValue, expiresAt: new Date(Date.now() + CODE_TTL_MS) },
   });
-
-  return {
-    accessToken: signAccessToken({ sub: user.id, role: user.role, mfa: mfaVerified }),
-    refreshToken: refresh.raw,
-    user: publicUser(user),
-    // Staff without MFA can only reach the MFA setup endpoints
-    mfaSetupRequired: isStaff(user.role) && !user.mfaEnabled,
-  };
+  if (allowed) await sendEmail({ to: emailAddr, ...emailTemplates.loginCode(code) });
+  return { ok: true, resendInSeconds: RESEND_COOLDOWN_S, expiresInSeconds: CODE_TTL_MS / 1000 };
 }
 
-export async function signup(input: { email: string; password: string; referralCode?: string }) {
-  const email = input.email.toLowerCase();
-  const existing = await prisma.user.findUnique({ where: { email } });
-  if (existing) throw ApiError.conflict('An account with this email already exists');
+export const startEmailSignIn = (input: { email: string } & SignupMeta) =>
+  issueCode(input.email, { portal: input.portal, referralCode: input.referralCode, platform: input.platform, handle: input.handle });
 
-  const referrer = input.referralCode
-    ? await prisma.user.findUnique({ where: { referralCode: input.referralCode.toUpperCase() } })
+export async function resendEmailCode(emailAddr: string) {
+  // Keeps what the first form sent (portal, referral, platform, handle).
+  const last = await prisma.loginCode.findFirst({ where: { email: emailAddr }, orderBy: { createdAt: 'desc' } });
+  if (!last) throw ApiError.badRequest('Start again with your email');
+  return issueCode(emailAddr, (last.meta as unknown as SignupMeta) ?? { portal: 'TRADER' });
+}
+
+export async function verifyEmailCode(req: FastifyRequest, reply: FastifyReply, emailAddr: string, code: string) {
+  const record = await prisma.loginCode.findFirst({
+    where: { email: emailAddr, usedAt: null, expiresAt: { gt: new Date() } },
+    orderBy: { createdAt: 'desc' },
+  });
+  if (!record) throw ApiError.badRequest('This code has expired. Request a new one.');
+  if (record.attempts >= MAX_ATTEMPTS) throw new ApiError(429, 'TOO_MANY_ATTEMPTS', 'Too many wrong codes. Request a new one.');
+
+  const expected = Buffer.from(record.codeHash, 'hex');
+  const given = Buffer.from(hashCode(emailAddr, code), 'hex');
+  if (!timingSafeEqual(expected, given)) {
+    await prisma.loginCode.update({ where: { id: record.id }, data: { attempts: { increment: 1 } } });
+    throw new ApiError(400, 'BAD_CODE', 'That code is not correct.');
+  }
+  await prisma.loginCode.updateMany({ where: { email: emailAddr, usedAt: null }, data: { usedAt: new Date() } });
+
+  const { user, isNewUser } = await signInOrCreate(emailAddr, record.meta as unknown as SignupMeta, {});
+  await startSession(req, reply, user, 'customer', false);
+  await audit({ actorId: user.id, action: isNewUser ? 'auth.signup.email' : 'auth.login.email', ip: req.ip });
+  return { user: publicUser(user), isNewUser, needsProfile: needsProfile(user) };
+}
+
+// ------------------------------ Google ------------------------------
+
+export async function signInWithGoogle(req: FastifyRequest, reply: FastifyReply, input: { credential: string } & SignupMeta) {
+  if (!env.GOOGLE_CLIENT_ID) throw new ApiError(503, 'GOOGLE_DISABLED', 'Google sign-in is not configured yet');
+
+  // Google verifies the signature and expiry; we check it was issued for our app and the email is verified.
+  const res = await fetch(`https://oauth2.googleapis.com/tokeninfo?id_token=${encodeURIComponent(input.credential)}`);
+  const info = (await res.json().catch(() => ({}))) as { aud?: string; sub?: string; email?: string; email_verified?: string | boolean };
+  if (!res.ok || info.aud !== env.GOOGLE_CLIENT_ID || !info.sub || !info.email || String(info.email_verified) !== 'true') {
+    throw ApiError.unauthorized('Google sign-in failed. Try again.');
+  }
+
+  const emailAddr = info.email.toLowerCase();
+  const { user, isNewUser } = await signInOrCreate(emailAddr, input, { googleSub: info.sub });
+  await startSession(req, reply, user, 'customer', false);
+  await audit({ actorId: user.id, action: isNewUser ? 'auth.signup.google' : 'auth.login.google', ip: req.ip });
+  return { user: publicUser(user), isNewUser, needsProfile: needsProfile(user) };
+}
+
+// ------------------------------ Shared ------------------------------
+
+async function signInOrCreate(emailAddr: string, meta: SignupMeta, extra: { googleSub?: string }) {
+  const existing = await prisma.user.findUnique({ where: { email: emailAddr } });
+  if (existing) {
+    if (existing.role !== 'USER') throw ApiError.forbidden('Staff accounts sign in on the admin console');
+    if (!existing.isActive || existing.deletedAt) throw ApiError.forbidden('This account is suspended. Contact support.');
+    if (extra.googleSub && existing.googleSub && existing.googleSub !== extra.googleSub) {
+      throw ApiError.forbidden('This email is linked to a different Google account');
+    }
+
+    // Signing in through a flow joins that dashboard (e.g. a trader using /affiliates/join),
+    // unless an admin has set this customer's portals by hand.
+    const addPortal = !existing.portalsManagedByAdmin && !existing.portals.includes(meta.portal);
+    const user = await prisma.user.update({
+      where: { id: existing.id },
+      data: {
+        lastLoginAt: new Date(),
+        emailVerified: true,
+        emailVerifiedAt: existing.emailVerifiedAt ?? new Date(),
+        ...(extra.googleSub && !existing.googleSub ? { googleSub: extra.googleSub } : {}),
+        ...(addPortal ? { portals: { push: meta.portal } } : {}),
+        ...(meta.portal === 'AFFILIATE' && meta.platform && !existing.signupPlatform ? { signupPlatform: meta.platform, signupHandle: meta.handle?.replace(/^@/, '') } : {}),
+      },
+    });
+    return { user, isNewUser: false };
+  }
+
+  const referrer = meta.referralCode
+    ? await prisma.user.findUnique({ where: { referralCode: meta.referralCode.toUpperCase() } })
     : null;
-
   const user = await prisma.user.create({
     data: {
-      email,
-      passwordHash: await hashPassword(input.password),
+      email: emailAddr,
+      role: 'USER',
+      portals: [meta.portal],
+      emailVerified: true,
+      emailVerifiedAt: new Date(),
       referralCode: generateReferralCode(),
-      referredById: referrer?.id,
+      referredById: referrer?.role === 'USER' ? referrer.id : undefined,
+      signupPlatform: meta.portal === 'AFFILIATE' ? meta.platform : undefined,
+      signupHandle: meta.portal === 'AFFILIATE' ? meta.handle?.replace(/^@/, '') : undefined,
+      googleSub: extra.googleSub,
+      lastLoginAt: new Date(),
     },
   });
-
-  await sendVerificationEmail(user);
-  return { id: user.id, email: user.email };
-}
-
-async function sendVerificationEmail(user: User) {
-  const token = generateToken();
-  await prisma.emailToken.create({
-    data: {
-      userId: user.id,
-      type: 'VERIFY_EMAIL',
-      tokenHash: token.hash,
-      expiresAt: new Date(Date.now() + DAY_MS),
-    },
-  });
-  await sendEmail({ to: user.email, ...emailTemplates.verifyEmail(token.raw) });
-}
-
-export async function verifyEmail(rawToken: string) {
-  const record = await prisma.emailToken.findUnique({ where: { tokenHash: sha256(rawToken) } });
-  if (!record || record.type !== 'VERIFY_EMAIL' || record.usedAt || record.expiresAt < new Date()) {
-    throw ApiError.badRequest('Verification link is invalid or expired');
-  }
-  await prisma.$transaction([
-    prisma.emailToken.update({ where: { id: record.id }, data: { usedAt: new Date() } }),
-    prisma.user.update({
-      where: { id: record.userId },
-      data: { emailVerified: true, emailVerifiedAt: new Date() },
-    }),
-  ]);
-}
-
-export async function login(input: { email: string; password: string }, ip?: string) {
-  const user = await prisma.user.findUnique({ where: { email: input.email.toLowerCase() } });
-  const valid = await verifyPassword(input.password, user?.passwordHash ?? DUMMY_HASH);
-
-  if (!user || !valid || user.deletedAt || !user.isActive) {
-    throw ApiError.unauthorized('Invalid email or password');
-  }
-  if (!user.emailVerified) throw ApiError.forbidden('Please verify your email first');
-
-  // Staff with MFA enabled must also enter a one-time code
-  if (isStaff(user.role) && user.mfaEnabled) {
-    return { mfaRequired: true as const, mfaToken: signMfaChallengeToken(user.id) };
-  }
-
-  await audit({ actorId: user.id, action: 'auth.login', ip });
-  return issueSession(user, false);
-}
-
-export async function verifyMfaLogin(input: { mfaToken: string; code: string }, ip?: string) {
-  const userId = verifyMfaChallengeToken(input.mfaToken);
-  const user = await prisma.user.findUnique({ where: { id: userId } });
-  if (!user || !user.mfaEnabled || !user.mfaSecret || user.deletedAt || !user.isActive) {
-    throw ApiError.unauthorized('MFA is not available for this account');
-  }
-  if (!authenticator.check(input.code, decrypt(user.mfaSecret))) {
-    throw ApiError.unauthorized('Invalid MFA code');
-  }
-  await audit({ actorId: user.id, action: 'auth.login.mfa', ip });
-  return issueSession(user, true);
-}
-
-// Refresh token rotation: the old token is revoked, a new one is issued.
-export async function refresh(rawToken: string) {
-  const record = await prisma.refreshToken.findUnique({
-    where: { tokenHash: sha256(rawToken) },
-    include: { user: true },
-  });
-  if (!record || record.revokedAt || record.expiresAt < new Date()) {
-    throw ApiError.unauthorized('Invalid refresh token');
-  }
-  if (record.user.deletedAt || !record.user.isActive) throw ApiError.unauthorized('Account is disabled');
-
-  await prisma.refreshToken.update({ where: { id: record.id }, data: { revokedAt: new Date() } });
-  return issueSession(record.user, record.mfaVerified);
-}
-
-export async function logout(rawToken: string) {
-  await prisma.refreshToken.updateMany({
-    where: { tokenHash: sha256(rawToken), revokedAt: null },
-    data: { revokedAt: new Date() },
-  });
-}
-
-export async function forgotPassword(email: string) {
-  const user = await prisma.user.findUnique({ where: { email: email.toLowerCase() } });
-  // Always succeed so attackers cannot discover which emails exist.
-  if (!user || user.deletedAt || !user.isActive) return;
-
-  const token = generateToken();
-  await prisma.emailToken.create({
-    data: {
-      userId: user.id,
-      type: 'PASSWORD_RESET',
-      tokenHash: token.hash,
-      expiresAt: new Date(Date.now() + 60 * 60 * 1000),
-    },
-  });
-  await sendEmail({ to: user.email, ...emailTemplates.passwordReset(token.raw) });
-}
-
-export async function resetPassword(rawToken: string, newPassword: string) {
-  const record = await prisma.emailToken.findUnique({ where: { tokenHash: sha256(rawToken) } });
-  if (!record || record.type !== 'PASSWORD_RESET' || record.usedAt || record.expiresAt < new Date()) {
-    throw ApiError.badRequest('Reset link is invalid or expired');
-  }
-  await prisma.$transaction([
-    prisma.emailToken.update({ where: { id: record.id }, data: { usedAt: new Date() } }),
-    prisma.user.update({
-      where: { id: record.userId },
-      data: { passwordHash: await hashPassword(newPassword) },
-    }),
-    // Log out every device after a password reset
-    prisma.refreshToken.updateMany({
-      where: { userId: record.userId, revokedAt: null },
-      data: { revokedAt: new Date() },
-    }),
-  ]);
-}
-
-// ----------------------- MFA (TOTP) for admin accounts -----------------
-
-export async function setupMfa(userId: string) {
-  const user = await prisma.user.findUniqueOrThrow({ where: { id: userId } });
-  if (user.mfaEnabled) throw ApiError.conflict('MFA is already enabled');
-
-  const secret = authenticator.generateSecret();
-  await prisma.user.update({ where: { id: userId }, data: { mfaSecret: encrypt(secret) } });
-
-  // The frontend renders this URL as a QR code for an authenticator app
-  return { secret, otpauthUrl: authenticator.keyuri(user.email, env.MFA_ISSUER, secret) };
-}
-
-export async function enableMfa(userId: string, code: string) {
-  const user = await prisma.user.findUniqueOrThrow({ where: { id: userId } });
-  if (!user.mfaSecret) throw ApiError.badRequest('Start MFA setup first');
-  if (!authenticator.check(code, decrypt(user.mfaSecret))) throw ApiError.badRequest('Invalid MFA code');
-
-  const updated = await prisma.user.update({ where: { id: userId }, data: { mfaEnabled: true } });
-  await audit({ actorId: userId, action: 'auth.mfa.enabled' });
-  // Return a fresh MFA-verified session so the admin can continue right away
-  return issueSession(updated, true);
+  return { user, isNewUser: true };
 }
 
 export async function getMe(userId: string) {
-  const user = await prisma.user.findUniqueOrThrow({
-    where: { id: userId },
-    include: { permissions: true },
+  const user = await prisma.user.findUniqueOrThrow({ where: { id: userId } });
+  return { user: publicUser(user), needsProfile: needsProfile(user), access: await loadAccess(userId) };
+}
+
+export async function updateProfile(userId: string, input: { username?: string; avatar?: string; leaderboardPublic?: boolean }) {
+  if (input.username) {
+    const taken = await prisma.user.findFirst({ where: { username: { equals: input.username, mode: 'insensitive' }, id: { not: userId } } });
+    if (taken) throw ApiError.conflict('That username is taken');
+  }
+  const user = await prisma.user.update({ where: { id: userId }, data: input });
+  await audit({ actorId: userId, action: 'profile.updated', metadata: input });
+  return { user: publicUser(user), needsProfile: needsProfile(user) };
+}
+
+export async function isUsernameAvailable(username: string) {
+  const taken = await prisma.user.findFirst({ where: { username: { equals: username, mode: 'insensitive' } } });
+  return { username, available: !taken };
+}
+
+// ------------------------------ Sessions (Active devices) ------------------------------
+
+export async function listSessions(req: FastifyRequest, userId: string) {
+  const current = currentSessionHash(req, 'customer');
+  const rows = await prisma.refreshToken.findMany({
+    where: { userId, revokedAt: null, expiresAt: { gt: new Date() } },
+    orderBy: { lastUsedAt: 'desc' },
   });
-  return { ...publicUser(user), permissions: user.permissions.map((p) => p.section) };
+  return rows.map((r) => ({
+    id: r.id,
+    device: deviceLabel(r.userAgent),
+    ip: r.ip,
+    lastActiveAt: r.lastUsedAt,
+    createdAt: r.createdAt,
+    current: r.tokenHash === current,
+  }));
+}
+
+export async function revokeSession(req: FastifyRequest, reply: FastifyReply, userId: string, sessionId: string) {
+  const row = await prisma.refreshToken.findFirst({ where: { id: sessionId, userId } });
+  if (!row) throw ApiError.notFound('Session not found');
+  await prisma.refreshToken.update({ where: { id: row.id }, data: { revokedAt: new Date() } });
+  if (row.tokenHash === currentSessionHash(req, 'customer')) await endSession(req, reply, 'customer');
+  return { ok: true };
+}
+
+export async function logoutEverywhere(req: FastifyRequest, reply: FastifyReply, userId: string) {
+  await revokeAllSessions(userId);
+  await endSession(req, reply, 'customer');
+  await audit({ actorId: userId, action: 'auth.logout_all', ip: req.ip });
+  return { ok: true };
 }

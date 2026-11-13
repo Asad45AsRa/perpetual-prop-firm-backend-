@@ -18,6 +18,13 @@ export const SETTING_DEFAULTS = {
   affiliate: {
     commissionPct: '10',
   },
+  // Admin console kill switches (frontend Platform settings). Shown to every staff member via /admin/auth/me.
+  killSwitches: {
+    pauseTrading: false,
+    pausePurchases: false,
+    pausePayouts: false,
+    maintenanceMode: false,
+  },
 } as const;
 
 export type SettingKey = keyof typeof SETTING_DEFAULTS;

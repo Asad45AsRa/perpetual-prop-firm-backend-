@@ -10,17 +10,22 @@ export interface AccessPayload {
   mfa: boolean;
 }
 
+export interface VerifiedAccess extends AccessPayload {
+  /** Issued-at, seconds since epoch. */
+  iat: number;
+}
+
 export function signAccessToken(payload: AccessPayload): string {
   return jwt.sign({ ...payload, typ: 'access' }, env.JWT_ACCESS_SECRET, {
     expiresIn: env.ACCESS_TOKEN_TTL as jwt.SignOptions['expiresIn'],
   });
 }
 
-export function verifyAccessToken(token: string): AccessPayload {
+export function verifyAccessToken(token: string): VerifiedAccess {
   try {
     const decoded = jwt.verify(token, env.JWT_ACCESS_SECRET) as jwt.JwtPayload;
     if (decoded.typ !== 'access') throw new Error('wrong token type');
-    return { sub: decoded.sub as string, role: decoded.role, mfa: Boolean(decoded.mfa) };
+    return { sub: decoded.sub as string, role: decoded.role, mfa: Boolean(decoded.mfa), iat: Number(decoded.iat ?? 0) };
   } catch {
     throw ApiError.unauthorized('Invalid or expired token');
   }

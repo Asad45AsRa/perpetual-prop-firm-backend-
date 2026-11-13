@@ -1,6 +1,6 @@
 import type { FastifyInstance } from 'fastify';
 import { z } from 'zod';
-import { authenticate } from '../../middleware/auth';
+import { requirePortal } from '../../middleware/auth';
 import { Decimal } from '../../utils/decimal';
 import { parse } from '../../utils/validate';
 import * as service from './trading.service';
@@ -20,7 +20,8 @@ const orderSchema = z.object({
 const accountParams = z.object({ accountId: z.string().uuid() });
 
 export async function tradingRoutes(app: FastifyInstance) {
-  app.addHook('preHandler', authenticate);
+  // Trader dashboard + terminal only (ownership of each account is checked in the service).
+  app.addHook('preHandler', requirePortal('TRADER'));
 
   app.get('/accounts', async (req) => service.listMyAccounts(req.user!.id));
 

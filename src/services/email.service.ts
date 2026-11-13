@@ -26,13 +26,10 @@ export async function sendEmail(input: EmailInput): Promise<void> {
 }
 
 export const emailTemplates = {
-  verifyEmail: (token: string) => ({
-    subject: 'Verify your email',
-    html: `<p>Welcome! Confirm your email address:</p><p><a href="${env.FRONTEND_URL}/verify-email?token=${token}">Verify email</a></p>`,
-  }),
-  passwordReset: (token: string) => ({
-    subject: 'Reset your password',
-    html: `<p>Use this link to reset your password (valid for 1 hour):</p><p><a href="${env.FRONTEND_URL}/reset-password?token=${token}">Reset password</a></p>`,
+  // Passwordless sign-in (trader /signup and affiliate /affiliates/join)
+  loginCode: (code: string) => ({
+    subject: `${code} is your Perpeye sign-in code`,
+    html: `<p>Your sign-in code is:</p><p style="font-size:28px;letter-spacing:6px;font-weight:600">${code}</p><p>It expires in 10 minutes. If you did not ask for it, you can ignore this email.</p>`,
   }),
   challengeActivated: (planName: string) => ({
     subject: 'Your challenge account is active',

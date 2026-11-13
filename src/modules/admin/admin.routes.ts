@@ -1,7 +1,7 @@
 import type { FastifyInstance } from 'fastify';
 import { z } from 'zod';
 import { prisma } from '../../config/prisma';
-import { authenticate, requirePermission } from '../../middleware/auth';
+import { authenticate, requireAccess } from '../../middleware/auth';
 import { ApiError } from '../../utils/api-error';
 import { parse } from '../../utils/validate';
 import { audit } from '../audit/audit.service';
@@ -12,6 +12,7 @@ import * as payouts from '../payouts/payouts.service';
 import { lockAccount } from '../risk/risk.service';
 import { SETTING_DEFAULTS, getSetting, saveSetting, type SettingKey } from '../settings/settings.service';
 import { adminStaffRoutes } from './admin.staff.routes';
+import { adminRbacRoutes } from '../rbac/rbac.routes';
 
 const page = z.object({
   page: z.coerce.number().int().min(1).default(1),
@@ -39,9 +40,11 @@ export async function adminRoutes(app: FastifyInstance) {
 
   // Staff management (super admin only)
   await app.register(adminStaffRoutes, { prefix: '/staff' });
+  // Permission catalog + customer portal management
+  await app.register(adminRbacRoutes, { prefix: '/rbac' });
 
   // ------------------------------ Dashboard ----------------------------
-  app.get('/dashboard', { preHandler: requirePermission('system-health') }, async () => {
+  app.get('/dashboard', { preHandler: requireAccess('overview') }, async () => {
     const [users, activeAccounts, breached, pendingPayouts, revenue] = await Promise.all([
       prisma.user.count({ where: { role: 'USER' } }),
       prisma.tradingAccount.count({ where: { status: 'ACTIVE' } }),
@@ -53,7 +56,7 @@ export async function adminRoutes(app: FastifyInstance) {
   });
 
   // -------------------------------- Users ------------------------------
-  app.get('/users', { preHandler: requirePermission('users') }, async (req) => {
+  app.get('/users', { preHandler: requireAccess('traders') }, async (req) => {
     const { page: p, pageSize } = parse(page, req.query);
     const search = (req.query as { search?: string }).search;
     const where = search ? { email: { contains: search, mode: 'insensitive' as const } } : {};
@@ -70,7 +73,7 @@ export async function adminRoutes(app: FastifyInstance) {
     return { items, total, page: p, pageSize };
   });
 
-  app.patch('/users/:id/status', { preHandler: requirePermission('users') }, async (req) => {
+  app.patch('/users/:id/status', { preHandler: requireAccess('traders', 'manage', 'traders.suspend') }, async (req) => {
     const { id } = parse(idParams, req.params);
     const { isActive } = parse(z.object({ isActive: z.boolean() }), req.body);
     const target = await prisma.user.findUnique({ where: { id } });
@@ -85,17 +88,17 @@ export async function adminRoutes(app: FastifyInstance) {
   });
 
   // -------------------------------- Plans ------------------------------
-  app.get('/plans', { preHandler: requirePermission('plans') }, async () =>
+  app.get('/plans', { preHandler: requireAccess('plans') }, async () =>
     prisma.plan.findMany({ orderBy: { accountSize: 'asc' } }),
   );
 
-  app.post('/plans', { preHandler: requirePermission('plans') }, async (req, reply) => {
+  app.post('/plans', { preHandler: requireAccess('plans', 'manage') }, async (req, reply) => {
     const plan = await prisma.plan.create({ data: parse(planSchema, req.body) });
     await audit({ actorId: req.user!.id, action: 'plan.created', entity: 'Plan', entityId: plan.id });
     return reply.status(201).send(plan);
   });
 
-  app.patch('/plans/:id', { preHandler: requirePermission('plans') }, async (req) => {
+  app.patch('/plans/:id', { preHandler: requireAccess('plans', 'manage') }, async (req) => {
     const { id } = parse(idParams, req.params);
     const plan = await prisma.plan.update({ where: { id }, data: parse(planSchema.partial(), req.body) });
     await audit({ actorId: req.user!.id, action: 'plan.updated', entity: 'Plan', entityId: id });
@@ -103,17 +106,17 @@ export async function adminRoutes(app: FastifyInstance) {
   });
 
   // ------------------------------- Markets -----------------------------
-  app.get('/markets', { preHandler: requirePermission('markets') }, async () =>
+  app.get('/markets', { preHandler: requireAccess('markets') }, async () =>
     prisma.market.findMany({ orderBy: { symbol: 'asc' } }),
   );
 
-  app.post('/markets/sync', { preHandler: requirePermission('markets') }, async (req) => {
+  app.post('/markets/sync', { preHandler: requireAccess('markets', 'manage', 'market.sync') }, async (req) => {
     const synced = await syncMarkets();
     await audit({ actorId: req.user!.id, action: 'market.synced', metadata: { synced } });
     return { synced };
   });
 
-  app.patch('/markets/:id', { preHandler: requirePermission('markets') }, async (req) => {
+  app.patch('/markets/:id', { preHandler: requireAccess('markets', 'manage') }, async (req) => {
     const { id } = parse(idParams, req.params);
     const body = parse(
       z.object({
@@ -131,7 +134,7 @@ export async function adminRoutes(app: FastifyInstance) {
   });
 
   // ------------------------------ Accounts -----------------------------
-  app.get('/accounts', { preHandler: requirePermission('accounts') }, async (req) => {
+  app.get('/accounts', { preHandler: requireAccess('accounts') }, async (req) => {
     const { page: p, pageSize } = parse(page, req.query);
     const status = (req.query as { status?: string }).status;
     const where = status ? { status: status as 'ACTIVE' } : {};
@@ -149,7 +152,7 @@ export async function adminRoutes(app: FastifyInstance) {
   });
 
   // Manual lock: closes positions and disables the account
-  app.post('/accounts/:id/lock', { preHandler: requirePermission('accounts') }, async (req) => {
+  app.post('/accounts/:id/lock', { preHandler: requireAccess('accounts', 'manage', 'account.override') }, async (req) => {
     const { id } = parse(idParams, req.params);
     const { reason } = parse(z.object({ reason: z.string().min(3) }), req.body);
     await lockAccount(id, 'DISABLED', 'MANUAL_LOCK', reason, { reason }, req.user!.id);
@@ -157,13 +160,13 @@ export async function adminRoutes(app: FastifyInstance) {
   });
 
   // Full ledger of an account (transparency for admins)
-  app.get('/accounts/:id/ledger', { preHandler: requirePermission('accounts') }, async (req) => {
+  app.get('/accounts/:id/ledger', { preHandler: requireAccess('ledger') }, async (req) => {
     const { id } = parse(idParams, req.params);
     return prisma.ledgerEntry.findMany({ where: { accountId: id }, orderBy: { createdAt: 'desc' }, take: 200 });
   });
 
   // ----------------------------- Risk events ---------------------------
-  app.get('/risk-events', { preHandler: requirePermission('risk') }, async (req) => {
+  app.get('/risk-events', { preHandler: requireAccess('risk') }, async (req) => {
     const { page: p, pageSize } = parse(page, req.query);
     const [items, total] = await Promise.all([
       prisma.riskEvent.findMany({
@@ -178,38 +181,38 @@ export async function adminRoutes(app: FastifyInstance) {
   });
 
   // ------------------------------- Payouts -----------------------------
-  app.get('/payouts', { preHandler: requirePermission('payouts') }, async (req) => {
+  app.get('/payouts', { preHandler: requireAccess('payouts') }, async (req) => {
     const status = (req.query as { status?: 'REQUESTED' }).status;
     return payouts.listPayoutsForAdmin(status);
   });
-  app.post('/payouts/:id/approve', { preHandler: requirePermission('payouts') }, async (req) => {
+  app.post('/payouts/:id/approve', { preHandler: requireAccess('payouts', 'manage', 'payout.approve') }, async (req) => {
     await payouts.approvePayout(parse(idParams, req.params).id, req.user!.id);
     return { ok: true };
   });
-  app.post('/payouts/:id/reject', { preHandler: requirePermission('payouts') }, async (req) => {
+  app.post('/payouts/:id/reject', { preHandler: requireAccess('payouts', 'manage', 'payout.approve') }, async (req) => {
     const { reason } = parse(z.object({ reason: z.string().min(3) }), req.body);
     await payouts.rejectPayout(parse(idParams, req.params).id, req.user!.id, reason);
     return { ok: true };
   });
-  app.post('/payouts/:id/sent', { preHandler: requirePermission('payouts') }, async (req) => {
+  app.post('/payouts/:id/sent', { preHandler: requireAccess('payouts', 'manage', 'payout.approve') }, async (req) => {
     const { txHash } = parse(z.object({ txHash: z.string().min(10).max(128) }), req.body);
     await payouts.markPayoutSent(parse(idParams, req.params).id, req.user!.id, txHash);
     return { ok: true };
   });
-  app.post('/payouts/:id/confirm', { preHandler: requirePermission('payouts') }, async (req) => {
+  app.post('/payouts/:id/confirm', { preHandler: requireAccess('payouts', 'manage', 'payout.approve') }, async (req) => {
     await payouts.confirmPayout(parse(idParams, req.params).id, req.user!.id);
     return { ok: true };
   });
 
   // ------------------------------ Affiliates ---------------------------
-  app.get('/commissions', { preHandler: requirePermission('affiliates') }, async () =>
+  app.get('/commissions', { preHandler: requireAccess('affiliate-payouts') }, async () =>
     prisma.commission.findMany({
       include: { affiliate: { select: { email: true } } },
       orderBy: { createdAt: 'desc' },
       take: 200,
     }),
   );
-  app.patch('/commissions/:id', { preHandler: requirePermission('affiliates') }, async (req) => {
+  app.patch('/commissions/:id', { preHandler: requireAccess('affiliate-payouts', 'manage', 'payout.approve') }, async (req) => {
     const { id } = parse(idParams, req.params);
     const { status } = parse(z.object({ status: z.enum(['APPROVED', 'PAID', 'REJECTED']) }), req.body);
     await prisma.commission.update({ where: { id }, data: { status } });
@@ -218,10 +221,10 @@ export async function adminRoutes(app: FastifyInstance) {
   });
 
   // ---------------------- Website content (FAQ, rules) -----------------
-  app.get('/content', { preHandler: requirePermission('content') }, async () =>
+  app.get('/content', { preHandler: requireAccess('cms') }, async () =>
     prisma.contentBlock.findMany({ orderBy: { key: 'asc' } }),
   );
-  app.put('/content/:key', { preHandler: requirePermission('content') }, async (req) => {
+  app.put('/content/:key', { preHandler: requireAccess('cms', 'manage') }, async (req) => {
     const { key } = req.params as { key: string };
     const body = parse(z.object({ title: z.string().optional(), data: z.any() }), req.body);
     const block = await prisma.contentBlock.upsert({
@@ -234,12 +237,12 @@ export async function adminRoutes(app: FastifyInstance) {
   });
 
   // ---------------------------- Platform settings ----------------------
-  app.get('/settings', { preHandler: requirePermission('settings') }, async () => ({
+  app.get('/settings', { preHandler: requireAccess('settings') }, async () => ({
     trading: await getSetting('trading'),
     payout: await getSetting('payout'),
     affiliate: await getSetting('affiliate'),
   }));
-  app.put('/settings/:key', { preHandler: requirePermission('settings') }, async (req) => {
+  app.put('/settings/:key', { preHandler: requireAccess('settings', 'manage', 'settings.edit') }, async (req) => {
     const { key } = req.params as { key: string };
     if (!(key in SETTING_DEFAULTS)) throw ApiError.notFound('Unknown setting');
     const value = parse(z.record(z.any()), req.body);
@@ -249,7 +252,7 @@ export async function adminRoutes(app: FastifyInstance) {
   });
 
   // ------------------------------ Audit logs ---------------------------
-  app.get('/audit-logs', { preHandler: requirePermission('audit') }, async (req) => {
+  app.get('/audit-logs', { preHandler: requireAccess('audit-logs') }, async (req) => {
     const { page: p, pageSize } = parse(page, req.query);
     const [items, total] = await Promise.all([
       prisma.auditLog.findMany({
@@ -264,5 +267,5 @@ export async function adminRoutes(app: FastifyInstance) {
   });
 
   // ---------------------------- System health --------------------------
-  app.get('/system-health', { preHandler: requirePermission('system-health') }, async () => getHealth(true));
+  app.get('/system-health', { preHandler: requireAccess('health') }, async () => getHealth(true));
 }

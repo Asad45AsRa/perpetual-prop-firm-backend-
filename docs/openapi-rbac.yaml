@@ -1,0 +1,920 @@
+openapi: 3.0.3
+info:
+  title: Perpetual Prop Firm API - Auth & RBAC
+  version: 2.0.0
+  description: |
+    **Scope for now: authentication and RBAC only.** Trading, payments, payouts and admin feature endpoints
+    are left out of this file for the moment (kept commented at the bottom) and will be documented when they are wired.
+
+    Role-based access control for the three frontends: **trader dashboard**, **affiliate dashboard** and **admin panel**.
+
+    ## Who is who
+    | Role (DB) | Role (admin API) | Kind | How access works |
+    |---|---|---|---|
+    | `USER` | - | customer | Access comes from **portals**: `TRADER` (trader dashboard, terminal, challenges, payouts) and/or `AFFILIATE` (affiliate dashboard). Sign-up gives one portal; a trader can also join the affiliate program. Ownership (only *your* accounts/payouts) is enforced in the services. |
+    | `MODERATOR` | `moderator` | staff | Per-page access levels + special rights, granted by the super admin. |
+    | `ADMIN` | `admin` | staff | Same model as moderator, with a broader default preset. |
+    | `SUPER_ADMIN` | `super_admin` | staff | Everything, always. Cannot be changed, suspended or deleted. Only role that can manage staff. |
+
+    The admin endpoints use the lowercase roles (`super_admin` / `admin` / `moderator`), like the admin frontend.
+
+    ## Staff access model (mirrors the admin frontend)
+    1. **Page level** per admin page: `none` / `view` / `manage`. `view` = open and read the page. `manage` = also create, edit and run the page's normal actions. `manage` implies `view`.
+    2. **Special rights** for sensitive actions (moving money, kill switches...). Granted separately, so `manage` on a page never silently allows them.
+    3. Page keys are the admin sidebar page keys (frontend `src/components/admin/pages/*` `key`). The `staff` page is super-admin-only and can never be granted.
+
+    ## Sessions: httpOnly cookies (no tokens in the body)
+    | App | Cookies | Sent to |
+    |---|---|---|
+    | Customer (trader + affiliate) | `pp_at` (access, short-lived) + `pp_rt` (refresh) | `/api/v1/*` |
+    | Admin console | `pp_admin_at` + `pp_admin_rt` | `/api/v1/admin/*` only |
+
+    - Call the API with `credentials: "include"`. The two apps' sessions are separate; a staff cookie never signs into the customer app and vice versa.
+    - **Silent refresh:** when the access cookie is missing or expired, the refresh cookie is used automatically and rotated. There is no refresh endpoint.
+    - **CSRF:** a write (`POST/PUT/PATCH/DELETE`) that carries session cookies must come from an allowed `Origin` (403 otherwise) and be `Content-Type: application/json` (415 otherwise). An empty JSON body is read as `{}`.
+    - Force sign-out, suspension, role change, 2FA/password reset and "log out everywhere" end every session at once (the next request returns 401).
+
+    ## Customer sign-in (passwordless)
+    1. `POST /auth/email/start` -> a 6-digit code is emailed (valid 10 min). `POST /auth/email/resend` after 60 s.
+    2. `POST /auth/email/verify` -> session cookies + `{ user, isNewUser, needsProfile }`. New accounts are created here.
+    3. If `needsProfile`, finish onboarding with `PATCH /auth/profile` (username, then avatar).
+    4. Or `POST /auth/google` with a Google ID token (same response).
+
+    ## Admin sign-in (password + 2FA, always)
+    1. `POST /admin/auth/login` -> `{ challengeId, twoFactorSetupRequired, otpauthUrl? }`. `otpauthUrl` is returned the first time (or after "Reset 2FA"): show it as a QR code.
+    2. `POST /admin/auth/verify-2fa` with the 6-digit authenticator code -> admin session cookies + `{ user }`.
+
+    ## Errors
+    Every error is `{ code, message, requestId, details? }`; `requestId` also comes back in the `x-request-id` header.
+    - `400` `BAD_REQUEST` (validation, `details` has field errors) / `BAD_CODE` (wrong email code).
+    - `401` `UNAUTHORIZED` - not signed in, session ended, or account disabled. Admin: `BAD_CREDENTIALS`, `BAD_CODE`.
+    - `403` `FORBIDDEN` - signed in but not allowed. The `message` says exactly what is missing, e.g. `Requires "manage" access to the "payouts" section`. `PROTECTED` when acting on the super admin.
+    - `409` `CONFLICT` / `VERSION_CONFLICT` / `SELF_ACTION` / `SELF_DELETE`.
+    - `429` `RATE_LIMITED` / `RESEND_COOLDOWN` (`details.retryInSeconds`) / `TOO_MANY_ATTEMPTS`.
+
+    ## Guards
+    Each operation shows its guard in `x-rbac`: `public`, `customer`, `staff`, `super_admin`,
+    `portal:<TRADER|AFFILIATE>` or `section:<key>:<level>` + `right:<key>`.
+servers:
+  - url: http://localhost:4000
+    description: Local
+tags:
+  - name: Auth (customer)
+    description: Trader + affiliate sign-in with an email code or Google, onboarding profile, active devices.
+  - name: Auth (admin)
+    description: Admin console sign-in with password + 2FA.
+  - name: RBAC
+    description: Effective access and the permission catalog.
+  - name: Staff & permissions
+    description: Super admin only. Matches the admin "Staff & Permissions" page.
+  - name: Portals
+    description: Trader / affiliate dashboard access for customers.
+  # - name: Route matrix   (commented for now: non auth/RBAC routes)
+
+components:
+  securitySchemes:
+    customerCookie:
+      type: apiKey
+      in: cookie
+      name: pp_at
+      description: Customer session (set by `/auth/email/verify` or `/auth/google`). Renewed silently from `pp_rt`.
+    adminCookie:
+      type: apiKey
+      in: cookie
+      name: pp_admin_at
+      description: Admin session (set by `/admin/auth/verify-2fa`). Renewed silently from `pp_admin_rt`.
+  responses:
+    BadRequest:
+      description: Validation failed.
+      content:
+        application/json:
+          schema: { $ref: '#/components/schemas/Error' }
+          example: { code: BAD_REQUEST, message: Validation failed, requestId: 3f0c..., details: { fieldErrors: { email: [Invalid email] } } }
+    Unauthorized:
+      description: Not signed in, session ended (signed out elsewhere, forced out, suspended) or account disabled.
+      content:
+        application/json:
+          schema: { $ref: '#/components/schemas/Error' }
+          example: { code: UNAUTHORIZED, message: Please sign in, requestId: 3f0c... }
+    Forbidden:
+      description: Signed in but lacking the required role, portal, page level or special right.
+      content:
+        application/json:
+          schema: { $ref: '#/components/schemas/Error' }
+          examples:
+            section: { value: { code: FORBIDDEN, message: 'Requires "manage" access to the "payouts" section', requestId: 3f0c... } }
+            right: { value: { code: FORBIDDEN, message: 'Requires the special right: payout.approve', requestId: 3f0c... } }
+            portal: { value: { code: FORBIDDEN, message: Join the affiliate program to use the affiliate dashboard, requestId: 3f0c... } }
+            protected: { value: { code: PROTECTED, message: The super admin cannot be changed., requestId: 3f0c... } }
+    NotFound:
+      description: Not found.
+      content:
+        application/json:
+          schema: { $ref: '#/components/schemas/Error' }
+    RateLimited:
+      description: Too many requests.
+      content:
+        application/json:
+          schema: { $ref: '#/components/schemas/Error' }
+          example: { code: RATE_LIMITED, message: Too many requests, requestId: 3f0c... }
+  parameters:
+    IdParam:
+      name: id
+      in: path
+      required: true
+      schema: { type: string, format: uuid }
+  schemas:
+    Error:
+      type: object
+      description: Every error uses this shape. `requestId` equals the `x-request-id` response header.
+      required: [code, message, requestId]
+      properties:
+        code: { type: string, example: FORBIDDEN }
+        message: { type: string, description: Safe to show to the user. }
+        requestId: { type: string }
+        details: { description: 'Field errors, or e.g. `{ retryInSeconds }`.' }
+    Ok:
+      type: object
+      properties:
+        ok: { type: boolean, example: true }
+    Role:
+      type: string
+      description: Database role, used in `EffectiveAccess`.
+      enum: [USER, MODERATOR, ADMIN, SUPER_ADMIN]
+    AdminRole:
+      type: string
+      description: Role as the admin frontend uses it.
+      enum: [super_admin, admin, moderator]
+    StaffRoleEditable:
+      type: string
+      enum: [admin, moderator]
+      description: There can only be one super admin.
+    Portal:
+      type: string
+      enum: [TRADER, AFFILIATE]
+    Platform:
+      type: string
+      enum: [Instagram, Meta, TikTok]
+      description: Affiliate sign-up "where do you post" platform.
+    AccessLevel:
+      type: string
+      enum: [none, view, manage]
+    AdminSection:
+      type: string
+      description: Admin sidebar page key. `staff` is super-admin-only.
+      enum:
+        [overview, operations, reports, metrics, traders, accounts, activity, risk, markets, issuance, kyc, ledger,
+         trader-view, demo, leaderboard, plans, payments, payouts, approvals, affiliates, affiliate-payouts, coupons,
+         reserves, public-payouts, tickets, announcements, emails, cms, competitions, health, errors, webhooks, jobs,
+         alerts, audit-logs, settings, staff]
+    SpecialRight:
+      type: string
+      enum:
+        [finance.view, traders.suspend, risk.review, tickets.reply, kyc.review, payout.approve, approvals.decide,
+         account.override, refund.issue, market.sync, settings.edit, settings.kill_switch, audit.export]
+    PortalPermission:
+      type: string
+      enum:
+        [trader.dashboard.view, trader.accounts.view, trader.trade, trader.challenges.purchase, trader.demo.start,
+         trader.payouts.request, trader.payouts.view, trader.purchases.view, trader.leaderboard.view,
+         trader.profile.manage, affiliate.dashboard.view, affiliate.referrals.view, affiliate.referral_link.manage,
+         affiliate.commissions.view, affiliate.payouts.request, affiliate.payouts.view, affiliate.giveaways.view,
+         affiliate.certificates.view, affiliate.profile.manage]
+    SectionLevels:
+      type: object
+      description: Level for every admin page (`none` when not granted).
+      additionalProperties: { $ref: '#/components/schemas/AccessLevel' }
+      example: { overview: view, payouts: manage, settings: none }
+    Grants:
+      type: object
+      description: Page -> level. Pages not listed are `none`. `staff` is rejected (super-admin-only).
+      additionalProperties:
+        type: string
+        enum: [none, view, manage]
+      example: { overview: view, traders: manage, payouts: manage, settings: view }
+    EffectiveAccess:
+      type: object
+      required: [role, kind, isSuperAdmin, portals, permissions, sections, rights]
+      properties:
+        role: { $ref: '#/components/schemas/Role' }
+        kind: { type: string, enum: [user, staff] }
+        isSuperAdmin: { type: boolean }
+        portals:
+          type: array
+          items: { $ref: '#/components/schemas/Portal' }
+          description: Customer dashboards (always empty for staff).
+        permissions:
+          type: array
+          items: { $ref: '#/components/schemas/PortalPermission' }
+          description: Customer features unlocked by the portals (empty for staff).
+        sections: { $ref: '#/components/schemas/SectionLevels' }
+        rights:
+          type: array
+          items: { $ref: '#/components/schemas/SpecialRight' }
+      example:
+        role: USER
+        kind: user
+        isSuperAdmin: false
+        portals: [TRADER]
+        permissions: [trader.dashboard.view, trader.accounts.view, trader.trade]
+        sections: {}
+        rights: []
+    CustomerUser:
+      type: object
+      properties:
+        id: { type: string, format: uuid }
+        email: { type: string, format: email }
+        username: { type: string, nullable: true }
+        avatar: { type: string, nullable: true, example: /images/avatars/avatar-3.png }
+        leaderboardPublic: { type: boolean }
+        portals: { type: array, items: { $ref: '#/components/schemas/Portal' } }
+        referralCode: { type: string }
+        signupPlatform: { allOf: [{ $ref: '#/components/schemas/Platform' }], nullable: true }
+        signupHandle: { type: string, nullable: true, description: Without the leading @. }
+        createdAt: { type: string, format: date-time }
+    SignInResult:
+      type: object
+      description: Session cookies are set on this response.
+      properties:
+        user: { $ref: '#/components/schemas/CustomerUser' }
+        isNewUser: { type: boolean }
+        needsProfile: { type: boolean, description: True until a username and avatar are set (onboarding steps 3 and 4). }
+    CodeSent:
+      type: object
+      properties:
+        ok: { type: boolean, example: true }
+        resendInSeconds: { type: integer, example: 60 }
+        expiresInSeconds: { type: integer, example: 600 }
+    SignupMeta:
+      type: object
+      properties:
+        portal: { allOf: [{ $ref: '#/components/schemas/Portal' }], default: TRADER, description: Which sign-up page the person came from. }
+        referralCode: { type: string, description: From a referral link (new accounts only). }
+        platform: { allOf: [{ $ref: '#/components/schemas/Platform' }], description: Required when portal is AFFILIATE. }
+        handle: { type: string, description: 'Social handle, e.g. @hafiz.trades. Required when portal is AFFILIATE.' }
+    DeviceSession:
+      type: object
+      properties:
+        id: { type: string, format: uuid }
+        device: { type: string, example: Windows · Chrome }
+        ip: { type: string, nullable: true }
+        lastActiveAt: { type: string, format: date-time }
+        createdAt: { type: string, format: date-time }
+        current: { type: boolean, description: This browser. }
+    AdminUser:
+      type: object
+      description: The admin frontend's `AdminUser` (the signed-in staff member).
+      properties:
+        id: { type: string, format: uuid }
+        name: { type: string }
+        email: { type: string, format: email }
+        role: { $ref: '#/components/schemas/AdminRole' }
+        grants:
+          type: object
+          description: Only pages above `none`. Empty for the super admin (has everything).
+          additionalProperties: { type: string, enum: [view, manage] }
+        rights:
+          type: array
+          items: { $ref: '#/components/schemas/SpecialRight' }
+        protected: { type: boolean, description: true only for the super admin }
+    StaffMember:
+      description: One row of the Staff & Permissions table (frontend `Staff`).
+      allOf:
+        - $ref: '#/components/schemas/AdminUser'
+        - type: object
+          properties:
+            status: { type: string, enum: [active, suspended] }
+            twoFactor: { type: string, enum: [enabled, setup required] }
+            lastLoginAt: { type: string, description: ISO date, or "" if never. }
+            createdBy: { type: string, description: Email of the creator, or "". }
+            createdAt: { type: string, format: date-time }
+            version: { type: integer, description: Send back as `ifVersion` when editing. }
+    KillSwitches:
+      type: object
+      properties:
+        pauseTrading: { type: boolean }
+        pausePurchases: { type: boolean }
+        pausePayouts: { type: boolean }
+        maintenanceMode: { type: boolean }
+    Catalog:
+      type: object
+      properties:
+        levels:
+          type: array
+          items: { $ref: '#/components/schemas/AccessLevel' }
+        sections:
+          type: array
+          items:
+            type: object
+            properties:
+              key: { $ref: '#/components/schemas/AdminSection' }
+              label: { type: string }
+              group: { type: string, enum: [Workspace, Traders & trading, Finance & sales, Communication, Platform control] }
+              superOnly: { type: boolean }
+        rights:
+          type: array
+          items:
+            type: object
+            properties:
+              key: { $ref: '#/components/schemas/SpecialRight' }
+              label: { type: string }
+              hint: { type: string }
+        portals:
+          type: object
+          properties:
+            TRADER: { type: array, items: { $ref: '#/components/schemas/PortalPermission' } }
+            AFFILIATE: { type: array, items: { $ref: '#/components/schemas/PortalPermission' } }
+        rolePresets:
+          type: object
+          description: Default access applied when a staff member is created without explicit grants.
+          properties:
+            admin: { $ref: '#/components/schemas/Preset' }
+            moderator: { $ref: '#/components/schemas/Preset' }
+    Preset:
+      type: object
+      properties:
+        grants: { $ref: '#/components/schemas/Grants' }
+        rights:
+          type: array
+          items: { $ref: '#/components/schemas/SpecialRight' }
+
+paths:
+  # ------------------------------------------------------- Auth (customer)
+  /api/v1/auth/email/start:
+    post:
+      tags: [Auth (customer)]
+      summary: Send a 6-digit sign-in code (sign in or sign up)
+      description: |
+        Same response whether or not the email has an account (no account enumeration). Staff emails never get a code.
+        For a new account, `portal` / `referralCode` / `platform` / `handle` are kept with the code and used on verify.
+      x-rbac: public
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              allOf:
+                - type: object
+                  required: [email]
+                  properties:
+                    email: { type: string, format: email }
+                - $ref: '#/components/schemas/SignupMeta'
+            examples:
+              trader: { value: { email: trader@example.com, portal: TRADER } }
+              affiliate: { value: { email: hafiz@example.com, portal: AFFILIATE, platform: Instagram, handle: '@hafiz.trades' } }
+      responses:
+        '200': { description: Code sent, content: { application/json: { schema: { $ref: '#/components/schemas/CodeSent' } } } }
+        '400': { $ref: '#/components/responses/BadRequest' }
+        '429': { description: 'RESEND_COOLDOWN (`details.retryInSeconds`) or RATE_LIMITED (5/min).', content: { application/json: { schema: { $ref: '#/components/schemas/Error' } } } }
+  /api/v1/auth/email/resend:
+    post:
+      tags: [Auth (customer)]
+      summary: Send a new code (60 s cooldown)
+      x-rbac: public
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema: { type: object, required: [email], properties: { email: { type: string, format: email } } }
+      responses:
+        '200': { description: Code sent, content: { application/json: { schema: { $ref: '#/components/schemas/CodeSent' } } } }
+        '429':
+          description: Too soon.
+          content:
+            application/json:
+              schema: { $ref: '#/components/schemas/Error' }
+              example: { code: RESEND_COOLDOWN, message: Please wait 42s before requesting a new code, requestId: 3f0c..., details: { retryInSeconds: 42 } }
+  /api/v1/auth/email/verify:
+    post:
+      tags: [Auth (customer)]
+      summary: Check the code and sign in (creates the account if new)
+      description: Sets the `pp_at` / `pp_rt` cookies. 5 wrong tries end the code (`TOO_MANY_ATTEMPTS`); request a new one.
+      x-rbac: public
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              type: object
+              required: [email, code]
+              properties:
+                email: { type: string, format: email }
+                code: { type: string, pattern: '^\d{6}$', example: '482913' }
+      responses:
+        '200': { description: Signed in, content: { application/json: { schema: { $ref: '#/components/schemas/SignInResult' } } } }
+        '400':
+          description: Wrong or expired code.
+          content:
+            application/json:
+              schema: { $ref: '#/components/schemas/Error' }
+              example: { code: BAD_CODE, message: That code is not correct., requestId: 3f0c... }
+        '429': { description: TOO_MANY_ATTEMPTS or RATE_LIMITED (10/min)., content: { application/json: { schema: { $ref: '#/components/schemas/Error' } } } }
+  /api/v1/auth/google:
+    post:
+      tags: [Auth (customer)]
+      summary: Sign in / sign up with Google
+      description: Send the Google Identity Services ID token. 503 `GOOGLE_DISABLED` when the server has no `GOOGLE_CLIENT_ID`.
+      x-rbac: public
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              allOf:
+                - type: object
+                  required: [credential]
+                  properties:
+                    credential: { type: string, description: Google ID token (JWT). }
+                - $ref: '#/components/schemas/SignupMeta'
+      responses:
+        '200': { description: Signed in, content: { application/json: { schema: { $ref: '#/components/schemas/SignInResult' } } } }
+        '401': { $ref: '#/components/responses/Unauthorized' }
+        '503': { description: Google sign-in is not configured., content: { application/json: { schema: { $ref: '#/components/schemas/Error' } } } }
+  /api/v1/auth/username-available:
+    get:
+      tags: [Auth (customer)]
+      summary: Is a username free? (case-insensitive)
+      x-rbac: public
+      parameters:
+        - { name: username, in: query, required: true, schema: { type: string, pattern: '^[A-Za-z0-9_]{3,20}$' } }
+      responses:
+        '200':
+          description: Availability
+          content:
+            application/json:
+              schema: { type: object, properties: { username: { type: string }, available: { type: boolean } } }
+  /api/v1/auth/me:
+    get:
+      tags: [Auth (customer), RBAC]
+      summary: My profile + effective access
+      security: [{ customerCookie: [] }]
+      x-rbac: customer
+      responses:
+        '200':
+          description: Profile with access
+          content:
+            application/json:
+              schema:
+                type: object
+                properties:
+                  user: { $ref: '#/components/schemas/CustomerUser' }
+                  needsProfile: { type: boolean }
+                  access: { $ref: '#/components/schemas/EffectiveAccess' }
+        '401': { $ref: '#/components/responses/Unauthorized' }
+  /api/v1/auth/profile:
+    patch:
+      tags: [Auth (customer)]
+      summary: Update username / avatar / leaderboard visibility
+      description: Onboarding steps 3 (username) and 4 (avatar), and the Settings page visibility toggle. Send only what changes.
+      security: [{ customerCookie: [] }]
+      x-rbac: customer
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              type: object
+              properties:
+                username: { type: string, pattern: '^[A-Za-z0-9_]{3,20}$' }
+                avatar: { type: string, pattern: '^/images/.+\.(png|webp|jpg)$', example: /images/avatars/avatar-3.png }
+                leaderboardPublic: { type: boolean }
+      responses:
+        '200':
+          description: Updated
+          content:
+            application/json:
+              schema:
+                type: object
+                properties:
+                  user: { $ref: '#/components/schemas/CustomerUser' }
+                  needsProfile: { type: boolean }
+        '400': { $ref: '#/components/responses/BadRequest' }
+        '401': { $ref: '#/components/responses/Unauthorized' }
+        '409': { description: That username is taken., content: { application/json: { schema: { $ref: '#/components/schemas/Error' } } } }
+  /api/v1/auth/logout:
+    post:
+      tags: [Auth (customer)]
+      summary: Sign out this browser
+      x-rbac: public
+      responses:
+        '200': { description: Cookies cleared, content: { application/json: { schema: { $ref: '#/components/schemas/Ok' } } } }
+  /api/v1/auth/logout-all:
+    post:
+      tags: [Auth (customer)]
+      summary: Sign out on every device
+      security: [{ customerCookie: [] }]
+      x-rbac: customer
+      responses:
+        '200': { description: All sessions ended, content: { application/json: { schema: { $ref: '#/components/schemas/Ok' } } } }
+        '401': { $ref: '#/components/responses/Unauthorized' }
+  /api/v1/auth/sessions:
+    get:
+      tags: [Auth (customer)]
+      summary: Active devices
+      security: [{ customerCookie: [] }]
+      x-rbac: customer
+      responses:
+        '200':
+          description: Signed-in devices, most recent first
+          content:
+            application/json:
+              schema: { type: array, items: { $ref: '#/components/schemas/DeviceSession' } }
+        '401': { $ref: '#/components/responses/Unauthorized' }
+  /api/v1/auth/sessions/{id}:
+    delete:
+      tags: [Auth (customer)]
+      summary: Sign out one device
+      description: Revoking the current device also clears this browser's cookies.
+      security: [{ customerCookie: [] }]
+      x-rbac: customer
+      parameters: [{ $ref: '#/components/parameters/IdParam' }]
+      responses:
+        '200': { description: Revoked, content: { application/json: { schema: { $ref: '#/components/schemas/Ok' } } } }
+        '401': { $ref: '#/components/responses/Unauthorized' }
+        '404': { $ref: '#/components/responses/NotFound' }
+
+  # ---------------------------------------------------------- Auth (admin)
+  /api/v1/admin/auth/login:
+    post:
+      tags: [Auth (admin)]
+      summary: Step 1 - email + password
+      description: |
+        Returns a short-lived `challengeId` for step 2. The first time (or after "Reset 2FA") also returns
+        `otpauthUrl` to show as a QR code for Google Authenticator / 1Password etc.
+        Any failure (wrong password, unknown, suspended, not staff) gives the same 401.
+      x-rbac: public
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              type: object
+              required: [email, password]
+              properties:
+                email: { type: string, format: email }
+                password: { type: string }
+      responses:
+        '200':
+          description: Password accepted, 2FA needed
+          content:
+            application/json:
+              schema:
+                type: object
+                required: [challengeId, twoFactorSetupRequired]
+                properties:
+                  challengeId: { type: string }
+                  twoFactorSetupRequired: { type: boolean }
+                  otpauthUrl: { type: string, example: 'otpauth://totp/Perpeye:admin@perpeye.io?secret=...&issuer=Perpeye' }
+        '401':
+          description: Sign-in failed.
+          content:
+            application/json:
+              schema: { $ref: '#/components/schemas/Error' }
+              example: { code: BAD_CREDENTIALS, message: Sign-in failed. Check your details or contact the super admin., requestId: 3f0c... }
+        '429': { $ref: '#/components/responses/RateLimited' }
+  /api/v1/admin/auth/verify-2fa:
+    post:
+      tags: [Auth (admin)]
+      summary: Step 2 - authenticator code
+      description: Sets the `pp_admin_at` / `pp_admin_rt` cookies. Turns 2FA on if this was the setup sign-in.
+      x-rbac: public
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              type: object
+              required: [challengeId, code]
+              properties:
+                challengeId: { type: string }
+                code: { type: string, pattern: '^\d{6}$' }
+      responses:
+        '200':
+          description: Signed in
+          content:
+            application/json:
+              schema: { type: object, properties: { user: { $ref: '#/components/schemas/AdminUser' } } }
+        '401': { description: BAD_CODE, or the challenge expired., content: { application/json: { schema: { $ref: '#/components/schemas/Error' } } } }
+        '429': { $ref: '#/components/responses/RateLimited' }
+  /api/v1/admin/auth/me:
+    get:
+      tags: [Auth (admin), RBAC]
+      summary: Signed-in staff member + kill switches
+      security: [{ adminCookie: [] }]
+      x-rbac: staff
+      responses:
+        '200':
+          description: Session user
+          content:
+            application/json:
+              schema:
+                type: object
+                properties:
+                  user: { $ref: '#/components/schemas/AdminUser' }
+                  killSwitches: { $ref: '#/components/schemas/KillSwitches' }
+        '401': { $ref: '#/components/responses/Unauthorized' }
+  /api/v1/admin/auth/logout:
+    post:
+      tags: [Auth (admin)]
+      summary: Sign out of the admin console
+      x-rbac: public
+      responses:
+        '200': { description: Cookies cleared, content: { application/json: { schema: { type: object } } } }
+
+  # ------------------------------------------------------------------ RBAC
+  /api/v1/rbac/me:
+    get:
+      tags: [RBAC]
+      summary: My effective access (either app)
+      description: Use `kind` to pick the app, `portals`/`permissions` for customer menus, `sections`/`rights` for the admin sidebar and buttons.
+      security: [{ customerCookie: [] }, { adminCookie: [] }]
+      x-rbac: signed in
+      responses:
+        '200':
+          description: Effective access
+          content:
+            application/json:
+              schema: { $ref: '#/components/schemas/EffectiveAccess' }
+        '401': { $ref: '#/components/responses/Unauthorized' }
+  /api/v1/admin/rbac/catalog:
+    get:
+      tags: [RBAC]
+      summary: Permission catalog (pages, rights, portals, role presets)
+      description: Drives the Staff & Permissions page checkboxes.
+      security: [{ adminCookie: [] }]
+      x-rbac: staff
+      responses:
+        '200':
+          description: Catalog
+          content:
+            application/json:
+              schema: { $ref: '#/components/schemas/Catalog' }
+        '401': { $ref: '#/components/responses/Unauthorized' }
+
+  # --------------------------------------------------------------- Portals
+  /api/v1/affiliates/join:
+    post:
+      tags: [Portals]
+      summary: Existing trader joins the affiliate program
+      description: Adds the `AFFILIATE` portal. Idempotent. Refused (403) when an admin manages this customer's portals. No body needed.
+      security: [{ customerCookie: [] }]
+      x-rbac: customer
+      responses:
+        '200':
+          description: Portals after joining
+          content:
+            application/json:
+              schema:
+                type: object
+                properties:
+                  portals: { type: array, items: { $ref: '#/components/schemas/Portal' } }
+                  alreadyJoined: { type: boolean }
+        '401': { $ref: '#/components/responses/Unauthorized' }
+        '403': { $ref: '#/components/responses/Forbidden' }
+  /api/v1/admin/rbac/users/{id}/portals:
+    put:
+      tags: [Portals]
+      summary: Set a customer's portals
+      description: Grant or revoke the trader / affiliate dashboards for one customer. After this, sign-ups and "join" no longer change them.
+      security: [{ adminCookie: [] }]
+      x-rbac: section:affiliates:manage
+      parameters: [{ $ref: '#/components/parameters/IdParam' }]
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              type: object
+              required: [portals]
+              properties:
+                portals: { type: array, items: { $ref: '#/components/schemas/Portal' } }
+            example: { portals: [TRADER, AFFILIATE] }
+      responses:
+        '200':
+          description: Updated
+          content:
+            application/json:
+              schema:
+                type: object
+                properties:
+                  id: { type: string, format: uuid }
+                  portals: { type: array, items: { $ref: '#/components/schemas/Portal' } }
+        '400': { $ref: '#/components/responses/BadRequest' }
+        '401': { $ref: '#/components/responses/Unauthorized' }
+        '403': { $ref: '#/components/responses/Forbidden' }
+        '404': { $ref: '#/components/responses/NotFound' }
+
+  # ------------------------------------------------- Staff & permissions
+  /api/v1/admin/staff:
+    get:
+      tags: [Staff & permissions]
+      summary: List staff (paged)
+      security: [{ adminCookie: [] }]
+      x-rbac: super_admin
+      parameters:
+        - { name: page, in: query, schema: { type: integer, minimum: 1, default: 1 } }
+        - { name: pageSize, in: query, schema: { type: integer, minimum: 1, maximum: 100, default: 25 } }
+        - { name: q, in: query, description: Search name or email., schema: { type: string } }
+        - { name: facet, in: query, description: 'Comma list of filter values to return: `role,status`.', schema: { type: string } }
+      responses:
+        '200':
+          description: Page of staff
+          content:
+            application/json:
+              schema:
+                type: object
+                properties:
+                  items: { type: array, items: { $ref: '#/components/schemas/StaffMember' } }
+                  total: { type: integer }
+                  page: { type: integer }
+                  pageSize: { type: integer }
+                  facets:
+                    type: object
+                    additionalProperties: { type: array, items: { type: string } }
+                    example: { role: [super_admin, admin, moderator], status: [active, suspended] }
+        '401': { $ref: '#/components/responses/Unauthorized' }
+        '403': { $ref: '#/components/responses/Forbidden' }
+    post:
+      tags: [Staff & permissions]
+      summary: Create an admin or moderator
+      description: Omit `grants` and `rights` to start from the role preset (see the catalog). They set up 2FA on first sign-in.
+      security: [{ adminCookie: [] }]
+      x-rbac: super_admin
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              type: object
+              required: [name, email, password, role]
+              properties:
+                name: { type: string, minLength: 2, maxLength: 80 }
+                email: { type: string, format: email }
+                password: { type: string, minLength: 8, description: Temporary password. }
+                role: { $ref: '#/components/schemas/StaffRoleEditable' }
+                grants: { $ref: '#/components/schemas/Grants' }
+                rights: { type: array, items: { $ref: '#/components/schemas/SpecialRight' } }
+            example:
+              name: Sara K.
+              email: support@perpeye.io
+              password: temp-pass1
+              role: moderator
+              grants: { traders: view, payouts: manage }
+              rights: []
+      responses:
+        '201': { description: Created, content: { application/json: { schema: { $ref: '#/components/schemas/StaffMember' } } } }
+        '400': { $ref: '#/components/responses/BadRequest' }
+        '401': { $ref: '#/components/responses/Unauthorized' }
+        '403': { $ref: '#/components/responses/Forbidden' }
+        '409': { description: A staff member with this email already exists., content: { application/json: { schema: { $ref: '#/components/schemas/Error' } } } }
+  /api/v1/admin/staff/{id}:
+    parameters: [{ $ref: '#/components/parameters/IdParam' }]
+    get:
+      tags: [Staff & permissions]
+      summary: One staff member
+      security: [{ adminCookie: [] }]
+      x-rbac: super_admin
+      responses:
+        '200': { description: Staff member, content: { application/json: { schema: { $ref: '#/components/schemas/StaffMember' } } } }
+        '403': { $ref: '#/components/responses/Forbidden' }
+        '404': { $ref: '#/components/responses/NotFound' }
+    patch:
+      tags: [Staff & permissions]
+      summary: Edit name, role, page levels and rights (the Save button)
+      description: |
+        Send only what changes. `grants` / `rights` replace the current ones. A role change signs the person out everywhere.
+        Send `ifVersion` (the row's `version`) to get 409 `VERSION_CONFLICT` if someone else saved first.
+      security: [{ adminCookie: [] }]
+      x-rbac: super_admin
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              type: object
+              properties:
+                name: { type: string, minLength: 2, maxLength: 80 }
+                role: { $ref: '#/components/schemas/StaffRoleEditable' }
+                grants: { $ref: '#/components/schemas/Grants' }
+                rights: { type: array, items: { $ref: '#/components/schemas/SpecialRight' } }
+                ifVersion: { type: integer }
+            example:
+              grants: { overview: view, payouts: manage, traders: view }
+              rights: [payout.approve]
+              ifVersion: 3
+      responses:
+        '200': { description: Updated, content: { application/json: { schema: { $ref: '#/components/schemas/StaffMember' } } } }
+        '400': { $ref: '#/components/responses/BadRequest' }
+        '403': { $ref: '#/components/responses/Forbidden' }
+        '404': { $ref: '#/components/responses/NotFound' }
+        '409': { description: VERSION_CONFLICT., content: { application/json: { schema: { $ref: '#/components/schemas/Error' } } } }
+    delete:
+      tags: [Staff & permissions]
+      summary: Delete a staff member
+      description: Soft delete; ends every session and removes all access. The super admin and yourself cannot be deleted.
+      security: [{ adminCookie: [] }]
+      x-rbac: super_admin
+      responses:
+        '200': { description: Deleted, content: { application/json: { schema: { type: object } } } }
+        '403': { $ref: '#/components/responses/Forbidden' }
+        '404': { $ref: '#/components/responses/NotFound' }
+        '409': { description: SELF_DELETE., content: { application/json: { schema: { $ref: '#/components/schemas/Error' } } } }
+  /api/v1/admin/staff/{id}/{action}:
+    post:
+      tags: [Staff & permissions]
+      summary: Row action (suspend, restore, force sign-out, reset 2FA, reset password)
+      description: |
+        - `suspend`: blocks sign-in and ends every session. `restore` undoes it.
+        - `force-logout`: ends every session now.
+        - `reset-2fa`: next sign-in shows a new QR code.
+        - `reset-password`: body `{ password }` (temporary, 8+ chars); ends every session.
+
+        Optional `reason` goes to the audit log. Not allowed on the super admin (403 `PROTECTED`) or yourself (409 `SELF_ACTION`).
+      security: [{ adminCookie: [] }]
+      x-rbac: super_admin
+      parameters:
+        - { $ref: '#/components/parameters/IdParam' }
+        - { name: action, in: path, required: true, schema: { type: string, enum: [suspend, restore, force-logout, reset-2fa, reset-password] } }
+      requestBody:
+        required: false
+        content:
+          application/json:
+            schema:
+              type: object
+              properties:
+                reason: { type: string, maxLength: 500 }
+                password: { type: string, minLength: 8, description: Only for reset-password. }
+      responses:
+        '200': { description: Updated row, content: { application/json: { schema: { $ref: '#/components/schemas/StaffMember' } } } }
+        '400': { $ref: '#/components/responses/BadRequest' }
+        '403': { $ref: '#/components/responses/Forbidden' }
+        '404': { $ref: '#/components/responses/NotFound' }
+        '409': { description: SELF_ACTION., content: { application/json: { schema: { $ref: '#/components/schemas/Error' } } } }
+
+  # ===== Commented for now: non auth/RBAC routes. Uncomment when they are documented. =====
+  # --------------------------------------------------------- Route matrix
+  # Existing routes, listed so every guard is documented in one place.
+  # /api/v1/trading/accounts:
+  #   get: { tags: [Route matrix], summary: My trading accounts, security: [{ customerCookie: [] }], x-rbac: portal:TRADER, responses: { '200': { description: OK }, '403': { $ref: '#/components/responses/Forbidden' } } }
+  # /api/v1/trading/accounts/{accountId}/orders:
+  #   post: { tags: [Route matrix], summary: Place an order (own account only), security: [{ customerCookie: [] }], x-rbac: portal:TRADER + ownership, parameters: [{ name: accountId, in: path, required: true, schema: { type: string, format: uuid } }], responses: { '201': { description: Created }, '403': { $ref: '#/components/responses/Forbidden' } } }
+  # /api/v1/payments/checkout:
+  #   post: { tags: [Route matrix], summary: Buy a challenge, security: [{ customerCookie: [] }], x-rbac: portal:TRADER, responses: { '200': { description: OK }, '403': { $ref: '#/components/responses/Forbidden' } } }
+  # /api/v1/payments/purchases:
+  #   get: { tags: [Route matrix], summary: Purchase history, security: [{ customerCookie: [] }], x-rbac: portal:TRADER, responses: { '200': { description: OK } } }
+  # /api/v1/payouts:
+  #   get: { tags: [Route matrix], summary: My payouts, security: [{ customerCookie: [] }], x-rbac: portal:TRADER, responses: { '200': { description: OK } } }
+  #   post: { tags: [Route matrix], summary: Request a payout (own funded account), security: [{ customerCookie: [] }], x-rbac: portal:TRADER + ownership, responses: { '201': { description: Created }, '403': { $ref: '#/components/responses/Forbidden' } } }
+  # /api/v1/affiliates/me:
+  #   get: { tags: [Route matrix], summary: Affiliate summary, security: [{ customerCookie: [] }], x-rbac: portal:AFFILIATE, responses: { '200': { description: OK }, '403': { $ref: '#/components/responses/Forbidden' } } }
+  # /api/v1/admin/dashboard:
+  #   get: { tags: [Route matrix], summary: Admin overview, security: [{ adminCookie: [] }], x-rbac: section:overview:view, responses: { '200': { description: OK }, '403': { $ref: '#/components/responses/Forbidden' } } }
+  # /api/v1/admin/users:
+  #   get: { tags: [Route matrix], summary: Trader list, security: [{ adminCookie: [] }], x-rbac: section:traders:view, responses: { '200': { description: OK } } }
+  # /api/v1/admin/users/{id}/status:
+  #   patch: { tags: [Route matrix], summary: Suspend / restore a trader, security: [{ adminCookie: [] }], x-rbac: section:traders:manage + right:traders.suspend, parameters: [{ $ref: '#/components/parameters/IdParam' }], responses: { '200': { description: OK }, '403': { $ref: '#/components/responses/Forbidden' } } }
+  # /api/v1/admin/plans:
+  #   get: { tags: [Route matrix], summary: Challenge plans, security: [{ adminCookie: [] }], x-rbac: section:plans:view, responses: { '200': { description: OK } } }
+  #   post: { tags: [Route matrix], summary: Create plan, security: [{ adminCookie: [] }], x-rbac: section:plans:manage, responses: { '201': { description: Created } } }
+  # /api/v1/admin/plans/{id}:
+  #   patch: { tags: [Route matrix], summary: Edit plan, security: [{ adminCookie: [] }], x-rbac: section:plans:manage, parameters: [{ $ref: '#/components/parameters/IdParam' }], responses: { '200': { description: OK } } }
+  # /api/v1/admin/markets:
+  #   get: { tags: [Route matrix], summary: Markets, security: [{ adminCookie: [] }], x-rbac: section:markets:view, responses: { '200': { description: OK } } }
+  # /api/v1/admin/markets/sync:
+  #   post: { tags: [Route matrix], summary: Sync from Hyperliquid, security: [{ adminCookie: [] }], x-rbac: section:markets:manage + right:market.sync, responses: { '200': { description: OK } } }
+  # /api/v1/admin/markets/{id}:
+  #   patch: { tags: [Route matrix], summary: Edit market, security: [{ adminCookie: [] }], x-rbac: section:markets:manage, parameters: [{ $ref: '#/components/parameters/IdParam' }], responses: { '200': { description: OK } } }
+  # /api/v1/admin/accounts:
+  #   get: { tags: [Route matrix], summary: Trading accounts, security: [{ adminCookie: [] }], x-rbac: section:accounts:view, responses: { '200': { description: OK } } }
+  # /api/v1/admin/accounts/{id}/lock:
+  #   post: { tags: [Route matrix], summary: Lock an account by hand, security: [{ adminCookie: [] }], x-rbac: section:accounts:manage + right:account.override, parameters: [{ $ref: '#/components/parameters/IdParam' }], responses: { '200': { description: OK } } }
+  # /api/v1/admin/accounts/{id}/ledger:
+  #   get: { tags: [Route matrix], summary: Account ledger, security: [{ adminCookie: [] }], x-rbac: section:ledger:view, parameters: [{ $ref: '#/components/parameters/IdParam' }], responses: { '200': { description: OK } } }
+  # /api/v1/admin/risk-events:
+  #   get: { tags: [Route matrix], summary: Risk events, security: [{ adminCookie: [] }], x-rbac: section:risk:view, responses: { '200': { description: OK } } }
+  # /api/v1/admin/payouts:
+  #   get: { tags: [Route matrix], summary: Trader payouts, security: [{ adminCookie: [] }], x-rbac: section:payouts:view, responses: { '200': { description: OK } } }
+  # /api/v1/admin/payouts/{id}/approve:
+  #   post: { tags: [Route matrix], summary: Approve payout, security: [{ adminCookie: [] }], x-rbac: section:payouts:manage + right:payout.approve, parameters: [{ $ref: '#/components/parameters/IdParam' }], responses: { '200': { description: OK }, '403': { $ref: '#/components/responses/Forbidden' } } }
+  # /api/v1/admin/payouts/{id}/reject:
+  #   post: { tags: [Route matrix], summary: Reject payout, security: [{ adminCookie: [] }], x-rbac: section:payouts:manage + right:payout.approve, parameters: [{ $ref: '#/components/parameters/IdParam' }], responses: { '200': { description: OK } } }
+  # /api/v1/admin/payouts/{id}/sent:
+  #   post: { tags: [Route matrix], summary: Mark payout sent (tx hash), security: [{ adminCookie: [] }], x-rbac: section:payouts:manage + right:payout.approve, parameters: [{ $ref: '#/components/parameters/IdParam' }], responses: { '200': { description: OK } } }
+  # /api/v1/admin/payouts/{id}/confirm:
+  #   post: { tags: [Route matrix], summary: Confirm payout, security: [{ adminCookie: [] }], x-rbac: section:payouts:manage + right:payout.approve, parameters: [{ $ref: '#/components/parameters/IdParam' }], responses: { '200': { description: OK } } }
+  # /api/v1/admin/commissions:
+  #   get: { tags: [Route matrix], summary: Affiliate commissions, security: [{ adminCookie: [] }], x-rbac: section:affiliate-payouts:view, responses: { '200': { description: OK } } }
+  # /api/v1/admin/commissions/{id}:
+  #   patch: { tags: [Route matrix], summary: Approve / pay / reject a commission, security: [{ adminCookie: [] }], x-rbac: section:affiliate-payouts:manage + right:payout.approve, parameters: [{ $ref: '#/components/parameters/IdParam' }], responses: { '200': { description: OK } } }
+  # /api/v1/admin/content:
+  #   get: { tags: [Route matrix], summary: Website CMS blocks, security: [{ adminCookie: [] }], x-rbac: section:cms:view, responses: { '200': { description: OK } } }
+  # /api/v1/admin/content/{key}:
+  #   put: { tags: [Route matrix], summary: Edit a CMS block, security: [{ adminCookie: [] }], x-rbac: section:cms:manage, parameters: [{ name: key, in: path, required: true, schema: { type: string } }], responses: { '200': { description: OK } } }
+  # /api/v1/admin/settings:
+  #   get: { tags: [Route matrix], summary: Platform settings, security: [{ adminCookie: [] }], x-rbac: section:settings:view, responses: { '200': { description: OK } } }
+  # /api/v1/admin/settings/{key}:
+  #   put: { tags: [Route matrix], summary: Change a setting, security: [{ adminCookie: [] }], x-rbac: section:settings:manage + right:settings.edit, parameters: [{ name: key, in: path, required: true, schema: { type: string } }], responses: { '200': { description: OK } } }
+  # /api/v1/admin/audit-logs:
+  #   get: { tags: [Route matrix], summary: Audit logs, security: [{ adminCookie: [] }], x-rbac: section:audit-logs:view, responses: { '200': { description: OK } } }
+  # /api/v1/admin/system-health:
+  #   get: { tags: [Route matrix], summary: System health, security: [{ adminCookie: [] }], x-rbac: section:health:view, responses: { '200': { description: OK } } }

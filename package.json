@@ -4,7 +4,9 @@
   "private": true,
   "description": "Backend API, trading engine and risk engine for the Perpetual Prop Firm platform",
   "main": "dist/server.js",
-  "engines": { "node": ">=20" },
+  "engines": {
+    "node": ">=20"
+  },
   "scripts": {
     "dev": "cross-env APP_ENV=development tsx watch src/server.ts",
     "dev:staging": "cross-env APP_ENV=staging tsx watch src/server.ts",
@@ -22,9 +24,12 @@
     "db:seed": "tsx prisma/seed.ts"
   },
   "dependencies": {
+    "@fastify/cookie": "^11.1.5",
     "@fastify/cors": "^10.0.0",
     "@fastify/helmet": "^13.0.0",
     "@fastify/rate-limit": "^10.0.0",
+    "@fastify/swagger": "^9.9.3",
+    "@fastify/swagger-ui": "^5.2.6",
     "@fastify/websocket": "^11.0.0",
     "@prisma/client": "^6.0.0",
     "bcryptjs": "^2.4.3",
