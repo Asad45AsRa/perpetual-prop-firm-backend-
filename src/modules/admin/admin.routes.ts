@@ -122,12 +122,28 @@ export async function adminRoutes(app: FastifyInstance) {
       z.object({
         isEnabled: z.boolean().optional(),
         isHalted: z.boolean().optional(),
+        // Close-only: existing positions can be reduced, no new exposure
+        isCloseOnly: z.boolean().optional(),
         maxLeverage: z.number().int().min(1).max(200).optional(),
+        // Reviewed limits (null removes the per-symbol cap)
+        maxNotionalUsd: z.number().positive().nullable().optional(),
+        minNotionalUsd: z.number().min(0).optional(),
+        // Per-market fee override (rate of notional, 0.0004 = 0.04 percent). null = use the fee group.
+        makerFeeRate: z.number().min(0).max(0.1).nullable().optional(),
+        takerFeeRate: z.number().min(0).max(0.1).nullable().optional(),
+        requireMarkConfirm: z.boolean().optional(),
+        fundingSupported: z.boolean().optional(),
+        marketType: z.enum(['CRYPTO', 'EQUITY', 'COMMODITY', 'INDEX', 'FX']).optional(),
       }),
       req.body,
     );
-    const market = await prisma.market.update({ where: { id }, data: body });
-    if (market.isEnabled) priceFeed.track(market.symbol);
+    // Any change to limits or fees starts a new version, stored on every later fill
+    const limitsChanged = Object.keys(body).some((k) => !['isEnabled', 'isHalted'].includes(k));
+    const market = await prisma.market.update({
+      where: { id },
+      data: { ...body, ...(limitsChanged ? { riskTierVersion: `admin-${Date.now()}` } : {}) },
+    });
+    if (market.isEnabled) priceFeed.track(market.symbol, market.hlKey);
     else priceFeed.untrack(market.symbol);
     await audit({ actorId: req.user!.id, action: 'market.updated', entity: 'Market', entityId: id, metadata: body });
     return market;

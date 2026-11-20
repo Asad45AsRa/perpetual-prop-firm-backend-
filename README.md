@@ -66,8 +66,8 @@ backend/
     services/              email.service.ts (Resend)
     modules/
       auth/                Step 3: signup, verify email, login, refresh, reset, admin MFA
-      markets/             Step 4: Hyperliquid client, live price feed, stale-price check, WS to frontend
-      trading/             Step 5: engine/calculations.ts (pure math), trading.service.ts, routes
+      markets/             Step 4: Hyperliquid client, order book + mark feed, stale checks, WS push, funding
+      trading/             Step 5: order-engine.ts (fills), order-matcher.ts (limits/stops), engine/* (pure math), routes
       risk/                Step 6: risk-rules.ts (pure), risk.service.ts (breach, pass, daily reset)
       ledger/              Only place allowed to change an account balance
       payments/            Step 7: Plisio invoices, signed webhook, one-time activation
@@ -129,6 +129,11 @@ Webhook: `POST /payments/plisio/callback`.
 Admin (`/admin/...`, staff + MFA + section permission): `dashboard`, `users`, `staff` (super admin), `plans`, `markets`,
 `accounts`, `risk-events`, `payouts`, `commissions`, `content`, `settings`, `audit-logs`, `system-health`.
 
+Trading engine (details, rules and error codes: `docs/trading-engine.md`):
+`POST /trading/accounts/:id/orders` (MARKET, LIMIT, STOP_MARKET, TAKE_PROFIT, STOP_LOSS), `PATCH|DELETE .../orders/:orderId`,
+`DELETE .../orders` (cancel all), `POST .../positions/:symbol/close`, `POST .../positions/close-all`, `PUT .../position-mode`.
+Market data: `GET /markets`, `GET /markets/:symbol`, `/price`, `/book`, `GET /markets/feed/status`. Live push: `ws://host/ws/market`.
+
 Order example:
 
 ```json
@@ -136,7 +141,7 @@ POST /api/v1/trading/accounts/<accountId>/orders
 { "symbol": "BTC", "side": "BUY", "size": "0.01", "leverage": 5, "clientOrderId": "abc-123" }
 ```
 
-Errors always look like `{ "error": { "code": "...", "message": "...", "details": ... } }`.
+Errors always look like `{ "code": "...", "message": "...", "requestId": "...", "details": ... }`.
 
 ## 6. First-run flow
 
@@ -148,9 +153,9 @@ Errors always look like `{ "error": { "code": "...", "message": "...", "details"
 
 ## 7. Not finished yet (next steps)
 
-- LIMIT orders, TP/SL, cancel/replace (engine currently supports MARKET orders, including reduce-only and close).
-- Funding rate simulation (the `FUNDING` ledger type exists, formula needs client approval).
-- Order-book based fills when depth data is tracked (currently best bid/ask plus configurable spread/slippage).
+- Advanced orders (Scale, TWAP, Chase Limit, Pair Trading, Reverse): phase 2 in the product spec.
+- Account-level WebSocket (private fills / positions push). Prices are pushed; account data is polled through the REST API.
+- Reviewed market registry for symbols beyond BTC/ETH/SOL (see `src/modules/markets/market.catalog.ts`).
 - On-chain verification of payout transaction hashes.
 - KYC / restricted jurisdictions, refund policy, competitions, email management, and richer email templates.
 - Database integration tests, load tests for 106 symbols, backups and recovery runbook, Redis queue if needed.
@@ -161,5 +166,3 @@ Errors always look like `{ "error": { "code": "...", "message": "...", "details"
 Account sizes and prices, profit target, daily-loss method (`BALANCE_BASED` or `EQUITY_BASED`), drawdown type
 (`STATIC` or `TRAILING`), daily reset hour (`DAILY_RESET_UTC_HOUR`), leverage caps, fees/funding, payout minimum and
 split, supported Plisio coins/networks, challenge-to-funded transition. All of these are configuration, not code.
-#   p e r p e t u a l - p r o p - f i r m - b a c k e n d -  
- 

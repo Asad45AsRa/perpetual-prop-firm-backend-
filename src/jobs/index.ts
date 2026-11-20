@@ -5,7 +5,9 @@ import { prisma } from '../config/prisma';
 import { toD, ZERO } from '../utils/decimal';
 import { audit } from '../modules/audit/audit.service';
 import { syncPurchaseWithPlisio } from '../modules/payments/payments.service';
+import { applyPendingFunding, captureFundingBoundary, hourStartOf } from '../modules/markets/funding.service';
 import { runDailyReset, runRiskMonitor } from '../modules/risk/risk.service';
+import { startOrderMatcher, stopOrderMatcher } from '../modules/trading/order-matcher';
 
 // Runs a job and logs failures instead of crashing the process.
 function safe(name: string, fn: () => Promise<void>) {
@@ -86,8 +88,15 @@ export function startJobs() {
     }
   }, 2000);
 
+  // Resting limit / stop / TP / SL orders against the live order book
+  startOrderMatcher();
+
   const utc = { timezone: 'UTC' };
   tasks.push(
+    // Funding: snapshot of the open positions exactly on every UTC hour (6-field cron: second 0)
+    cron.schedule('0 0 * * * *', safe('funding-capture', async () => void (await captureFundingBoundary(hourStartOf(Date.now())))), utc),
+    // Post the funding of closed hours as soon as the official rate is published (retries until it is)
+    cron.schedule('20 * * * * *', safe('funding-apply', async () => void (await applyPendingFunding())), utc),
     cron.schedule(`0 ${env.DAILY_RESET_UTC_HOUR} * * *`, safe('daily-reset', runDailyReset), utc),
     cron.schedule('*/5 * * * *', safe('stale-payments', checkStalePayments), utc),
     cron.schedule('15 * * * *', safe('ledger-reconciliation', reconcileLedger), utc),
@@ -98,6 +107,7 @@ export function startJobs() {
 }
 
 export function stopJobs() {
+  stopOrderMatcher();
   if (monitorTimer) clearInterval(monitorTimer);
   tasks.forEach((t) => t.stop());
 }

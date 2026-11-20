@@ -80,13 +80,45 @@ enum OrderSide {
 enum OrderType {
   MARKET
   LIMIT
+  // Entry stop: opens a position when the trigger price is touched
+  STOP_MARKET
+  // Exit orders attached to an open position (always reduce-only)
+  TAKE_PROFIT
+  STOP_LOSS
 }
 
+// NEW = resting limit or armed trigger order, PARTIALLY_FILLED = still working with a filled part.
 enum OrderStatus {
   NEW
+  PARTIALLY_FILLED
   FILLED
   CANCELED
   REJECTED
+}
+
+enum TimeInForce {
+  GTC
+  IOC
+}
+
+// ONE_WAY: one net position per market. HEDGE: independent long and short per market.
+enum PositionMode {
+  ONE_WAY
+  HEDGE
+}
+
+// Decides the fee group (see trading/engine/fees.ts) and the default leverage cap.
+enum MarketType {
+  CRYPTO
+  EQUITY
+  COMMODITY
+  INDEX
+  FX
+}
+
+enum Liquidity {
+  MAKER
+  TAKER
 }
 
 enum PositionSide {
@@ -331,6 +363,8 @@ model TradingAccount {
   dayStartBalance  Decimal       @default(0) @db.Decimal(20, 8)
   lastDailyResetAt DateTime?
   statusReason     String?
+  // Can only be changed while the account is flat (no positions, no working orders).
+  positionMode     PositionMode  @default(ONE_WAY)
   createdAt        DateTime      @default(now())
   updatedAt        DateTime      @updatedAt
 
@@ -340,29 +374,57 @@ model TradingAccount {
   ledgerEntries LedgerEntry[]
   riskEvents    RiskEvent[]
   payouts       Payout[]
+  fundingPayments FundingPayment[]
 
   @@index([userId])
   @@index([status])
 }
 
+// Market registry. A market only trades when it is enabled AND the live feed is healthy.
+// Limits that the owner must verify (maxNotionalUsd, caps per symbol) are editable from the admin panel.
 model Market {
   id             String   @id @default(uuid()) @db.Uuid
   symbol         String   @unique
   baseAsset      String
+  // Exact Hyperliquid coin key used for market data (HIP-3 prefixes are kept, never stripped)
+  hlKey          String   @unique
+  marketType     MarketType @default(CRYPTO)
   // Size decimals from Hyperliquid metadata
   szDecimals     Int
   // Price decimals allowed for this market (6 - szDecimals for perps)
   pricePrecision Int
+  // Smallest allowed price increment (10 ^ -pricePrecision)
+  priceTick      Decimal  @default(0) @db.Decimal(28, 10)
+  // Order size must be a multiple of this step (10 ^ -szDecimals)
+  sizeStep       Decimal  @default(0) @db.Decimal(28, 10)
   minSize        Decimal  @db.Decimal(28, 10)
+  // Smallest order value (Hyperliquid itself rejects orders below 10 USD)
+  minNotionalUsd Decimal  @default(10) @db.Decimal(20, 8)
+  // Max open notional per symbol and side, per account. Null = no per-symbol cap (gross overlay still applies).
+  maxNotionalUsd Decimal? @db.Decimal(20, 8)
   maxLeverage    Int
+  // Optional per-market fee overrides. Null = use the fee group default.
+  makerFeeRate   Decimal? @db.Decimal(12, 8)
+  takerFeeRate   Decimal? @db.Decimal(12, 8)
+  // Resting limit orders also need the mark price to cross the limit before they fill.
+  requireMarkConfirm Boolean @default(false)
+  fundingSupported Boolean @default(true)
+  // Bumped whenever limits or fees change, stored on every fill for dispute checks.
+  riskTierVersion String  @default("v1")
   isEnabled      Boolean  @default(false)
   isHalted       Boolean  @default(false)
+  // Existing positions may be reduced, but no new exposure is accepted.
+  isCloseOnly    Boolean  @default(false)
+  // Set when Hyperliquid reports the contract as delisted.
+  delistedAt     DateTime?
   createdAt      DateTime @default(now())
   updatedAt      DateTime @updatedAt
 
   orders    Order[]
   fills     Fill[]
   positions Position[]
+  fundingRates FundingRate[]
+  fundingPayments FundingPayment[]
 }
 
 model Order {
@@ -383,6 +445,22 @@ model Order {
   leverage      Int
   reduceOnly    Boolean     @default(false)
   rejectReason  String?
+  // Hedge mode: which position leg the order targets (also used by TP/SL in one-way mode)
+  positionSide  PositionSide?
+  timeInForce   TimeInForce @default(GTC)
+  // Rejected instead of filled as taker when it would cross the book at placement
+  postOnly      Boolean     @default(false)
+  // STOP_MARKET / TAKE_PROFIT / STOP_LOSS trigger price
+  triggerPrice  Decimal?    @db.Decimal(28, 10)
+  // Exit that always closes the whole current position (size follows the position)
+  closePosition Boolean     @default(false)
+  // Set when a trigger order fired and is now working against the book
+  triggeredAt   DateTime?
+  // Max allowed slippage for opening market orders, percent (3 = 3 percent)
+  maxSlippagePct Decimal?   @db.Decimal(10, 4)
+  // Margin + fee buffer held for the unfilled part of a resting opening order
+  reservedMargin Decimal    @default(0) @db.Decimal(20, 8)
+  cancelReason  String?
   createdAt     DateTime    @default(now())
   updatedAt     DateTime    @updatedAt
 
@@ -390,6 +468,8 @@ model Order {
 
   @@unique([accountId, clientOrderId])
   @@index([accountId, createdAt])
+  @@index([marketId, status])
+  @@index([accountId, status])
 }
 
 model Fill {
@@ -405,13 +485,23 @@ model Fill {
   size        Decimal   @db.Decimal(28, 10)
   fee         Decimal   @db.Decimal(20, 8)
   realizedPnl Decimal   @default(0) @db.Decimal(20, 8)
+  liquidity   Liquidity @default(TAKER)
+  // Fee rate that was applied (maker or taker), kept for audits
+  feeRate     Decimal   @default(0) @db.Decimal(12, 8)
+  positionSide PositionSide?
+  // Order book levels that were consumed: [[price, size], ...]. Proof for dispute checks.
+  bookLevels  Json?
+  // Time of the order book snapshot used for this fill
+  bookTime    DateTime?
+  rulesVersion String?
   createdAt   DateTime  @default(now())
 
   @@index([accountId, createdAt])
 }
 
-// Netting mode: one row per account + market. A closed position keeps
-// its row with size 0 and status CLOSED, and is reused when reopened.
+// One row per account + market + side. In ONE_WAY mode only one side has size at a time,
+// in HEDGE mode both can. A closed position keeps its row with size 0 and status CLOSED,
+// and is reused when reopened. "margin" is the initial margin (cross margin accounting).
 model Position {
   id               String         @id @default(uuid()) @db.Uuid
   accountId        String         @db.Uuid
@@ -429,8 +519,9 @@ model Position {
   openedAt         DateTime       @default(now())
   updatedAt        DateTime       @updatedAt
 
-  @@unique([accountId, marketId])
+  @@unique([accountId, marketId, side])
   @@index([status])
+  @@index([marketId, status])
 }
 
 // Append-only. Every balance change of a trading account is one row.
@@ -462,6 +553,47 @@ model RiskEvent {
 
   @@index([accountId, createdAt])
   @@index([type])
+}
+
+// ------------------------------ Funding ------------------------------
+
+// Hourly funding rate of a market, copied from Hyperliquid. One row per market and UTC hour.
+model FundingRate {
+  id        String   @id @default(uuid()) @db.Uuid
+  marketId  String   @db.Uuid
+  market    Market   @relation(fields: [marketId], references: [id])
+  // Start of the UTC hour the rate belongs to
+  hourStart DateTime
+  rate      Decimal  @db.Decimal(20, 12)
+  source    String   @default("hyperliquid")
+  createdAt DateTime @default(now())
+
+  @@unique([marketId, hourStart])
+}
+
+// One funding charge or credit per open position and UTC hour (replay safe through the unique key).
+// Created at the hour boundary with amount = null (rate pending) and completed once the rate is known.
+model FundingPayment {
+  id          String         @id @default(uuid()) @db.Uuid
+  accountId   String         @db.Uuid
+  account     TradingAccount @relation(fields: [accountId], references: [id])
+  positionId  String         @db.Uuid
+  marketId    String         @db.Uuid
+  market      Market         @relation(fields: [marketId], references: [id])
+  hourStart   DateTime
+  side        PositionSide
+  size        Decimal        @db.Decimal(28, 10)
+  // Oracle price at the boundary (Hyperliquid oraclePx)
+  oraclePrice Decimal?       @db.Decimal(28, 10)
+  rate        Decimal?       @db.Decimal(20, 12)
+  // Signed: negative = the account paid, positive = the account received
+  amount      Decimal?       @db.Decimal(20, 8)
+  appliedAt   DateTime?
+  createdAt   DateTime       @default(now())
+
+  @@unique([positionId, hourStart])
+  @@index([appliedAt])
+  @@index([accountId, hourStart])
 }
 
 // ------------------------ Payouts & affiliates -----------------------

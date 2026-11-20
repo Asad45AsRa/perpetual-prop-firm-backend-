@@ -3,7 +3,7 @@ import { env } from './config/env';
 import { logger } from './config/logger';
 import { prisma } from './config/prisma';
 import { startJobs, stopJobs } from './jobs';
-import { getEnabledSymbols, syncMarkets } from './modules/markets/market.service';
+import { getTrackedMarkets, syncMarkets } from './modules/markets/market.service';
 import { priceFeed } from './modules/markets/price-feed';
 
 async function main() {
@@ -15,7 +15,7 @@ async function main() {
   } catch (err) {
     logger.error({ err }, 'Market sync failed, continuing with markets already in the database');
   }
-  priceFeed.start(await getEnabledSymbols());
+  priceFeed.start(await getTrackedMarkets());
 
   const app = await buildApp();
   await app.listen({ port: env.PORT, host: env.HOST });

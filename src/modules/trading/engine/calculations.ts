@@ -137,3 +137,29 @@ export function liquidationPrice(
 export function isLiquidated(side: PositionSide, mark: Decimal, liqPrice: Decimal): boolean {
   return side === 'LONG' ? mark.lte(liqPrice) : mark.gte(liqPrice);
 }
+
+// =====================================================================
+// Cross margin accounting helpers (added with the order book engine).
+// =====================================================================
+
+// Initial margin of one fill: notional / leverage. A position keeps the SUM of the margins of its
+// opening fills, so adding with another leverage never re-margins the old part.
+export const initialMargin = (notionalValue: Decimal, leverage: number): Decimal => notionalValue.div(leverage);
+
+// Maintenance margin is a REFERENCE value only (default 50 percent of the initial margin).
+// It never triggers a liquidation by itself: accounts are closed by the daily / drawdown floors.
+export const maintenanceMarginRef = (im: Decimal, fraction: Decimal.Value = '0.5'): Decimal => im.mul(fraction);
+
+// When a position shrinks, its margin shrinks in the same proportion.
+export function scaleMarginOnReduce(oldMargin: Decimal, oldSize: Decimal, newSize: Decimal): Decimal {
+  if (oldSize.lte(0) || newSize.lte(0)) return new Decimal(0);
+  return oldMargin.mul(newSize).div(oldSize);
+}
+
+// Funding cash flow for one position and one hourly funding event.
+//   amount = -(signed size) x oracle price x hourly rate
+// Positive rate: longs pay and shorts receive. Negative rate: the opposite.
+export function fundingCashflow(side: PositionSide, size: Decimal, oraclePrice: Decimal, hourlyRate: Decimal.Value): Decimal {
+  const signedSize = side === 'LONG' ? size : size.negated();
+  return signedSize.mul(oraclePrice).mul(hourlyRate).negated();
+}

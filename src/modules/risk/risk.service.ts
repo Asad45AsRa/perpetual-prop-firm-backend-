@@ -7,6 +7,7 @@ import { postLedgerEntry } from '../ledger/ledger.service';
 import { priceFeed } from '../markets/price-feed';
 import { computeAccountSnapshot } from '../trading/account-snapshot';
 import { executeMarketOrder } from '../trading/trading.service';
+import { cancelActiveOrders } from '../trading/order-engine';
 import { isLiquidated } from '../trading/engine/calculations';
 import { evaluateRisk } from './risk-rules';
 
@@ -51,6 +52,8 @@ export async function lockAccount(
   await prisma.$transaction(
     async (tx) => {
       await tx.$queryRaw`SELECT id FROM "TradingAccount" WHERE id = ${accountId}::uuid FOR UPDATE`;
+      // Working orders (limits, stops, TP / SL) must not fire after the account is locked
+      await cancelActiveOrders(tx, accountId, `RISK_${eventType}`);
       await closeAllPositions(tx, accountId);
       await tx.tradingAccount.update({ where: { id: accountId }, data: { status, statusReason: reason } });
       await recordEvent(tx, accountId, eventType, details);
@@ -65,6 +68,7 @@ async function passChallenge(accountId: string, details: Prisma.InputJsonValue) 
   await prisma.$transaction(
     async (tx) => {
       await tx.$queryRaw`SELECT id FROM "TradingAccount" WHERE id = ${accountId}::uuid FOR UPDATE`;
+      await cancelActiveOrders(tx, accountId, 'CHALLENGE_PASSED');
       await closeAllPositions(tx, accountId);
 
       const account = await tx.tradingAccount.update({

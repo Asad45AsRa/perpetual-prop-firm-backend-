@@ -49,7 +49,19 @@ const schema = z.object({
   HYPERLIQUID_REST_URL: z.string().url().default('https://api.hyperliquid.xyz'),
   HYPERLIQUID_WS_URL: z.string().default('wss://api.hyperliquid.xyz/ws'),
   LAUNCH_SYMBOLS: z.string().default('BTC,ETH'),
-  STALE_PRICE_MS: z.coerce.number().int().default(5000),
+  // Trading is blocked when the order book (or the mark price) is older than this.
+  // STALE_PRICE_MS is the base value. STALE_BOOK_MS / STALE_MARK_MS override it per data type.
+  STALE_PRICE_MS: z.coerce.number().int().min(500).default(5000),
+  STALE_BOOK_MS: z.coerce.number().int().min(500).optional(),
+  STALE_MARK_MS: z.coerce.number().int().min(500).optional(),
+  // Timeout for every Hyperliquid REST call
+  HYPERLIQUID_TIMEOUT_MS: z.coerce.number().int().min(1000).default(8000),
+  // Watchdog: reconnect when the Hyperliquid socket is silent for this long
+  HYPERLIQUID_WS_SILENCE_MS: z.coerce.number().int().min(5000).default(20000),
+  // Live prices pushed to browsers are coalesced per symbol to this interval
+  WS_PUSH_INTERVAL_MS: z.coerce.number().int().min(50).default(250),
+  // How often resting limit / stop / TP / SL orders are checked against the live book
+  ORDER_MATCHER_INTERVAL_MS: z.coerce.number().int().min(100).default(500),
 
   ENABLE_JOBS: boolFromString,
   DAILY_RESET_UTC_HOUR: z.coerce.number().int().min(0).max(23).default(0),
@@ -73,6 +85,11 @@ export const launchSymbols = env.LAUNCH_SYMBOLS.split(',')
   .map((s) => s.trim().toUpperCase())
   .filter(Boolean);
 export const corsOrigins = env.CORS_ORIGINS.split(',').map((s) => s.trim());
+
+// Freshness limits (milliseconds). The mark price moves more slowly than the book on quiet
+// markets, so by default it is allowed to be a little older than the book.
+export const staleBookMs = env.STALE_BOOK_MS ?? env.STALE_PRICE_MS;
+export const staleMarkMs = env.STALE_MARK_MS ?? Math.max(env.STALE_PRICE_MS, 10_000);
 
 
 ///Test

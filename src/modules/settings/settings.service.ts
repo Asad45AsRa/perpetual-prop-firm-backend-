@@ -5,10 +5,33 @@ import { prisma } from '../../config/prisma';
 // a deploy. Each key has a typed default used until an admin saves a value.
 export const SETTING_DEFAULTS = {
   trading: {
-    takerFeeRate: '0.00045', // 0.045 percent of notional
-    spreadBps: '2', // simulated spread in basis points (used without order book)
-    slippageBps: '1', // simulated slippage in basis points
-    maintenanceMarginRate: '0.005', // 0.5 percent
+    // Legacy keys (kept so the admin settings page keeps working). The order book engine does not use them.
+    takerFeeRate: '0.00045',
+    spreadBps: '2',
+    slippageBps: '1',
+    maintenanceMarginRate: '0.005',
+    // Maker / taker fee per market group (rate of notional: 0.0004 = 0.04 percent)
+    fees: {
+      CRYPTO: { maker: '0.0001', taker: '0.0004' },
+      EQUITY: { maker: '0', taker: '0.0003' },
+      COMMODITY: { maker: '0', taker: '0.00005' },
+      INDEX: { maker: '0', taker: '0.00005' },
+      FX: { maker: '0', taker: '0.00005' },
+    },
+    // Opening market orders are rejected above this slippage (percent). Traders may choose a lower value.
+    defaultOpenSlippagePct: '3',
+    maxOpenSlippagePct: '10',
+    // Account-wide gross exposure must stay within this multiple of equity (new exposure only)
+    grossExposureMultiple: '10',
+    // Maintenance margin REFERENCE = this fraction of initial margin (display only, never liquidates)
+    mmrFractionOfImr: '0.5',
+    // Order count limits
+    maxOpenOrders: 50,
+    openOrderWarnAt: 40,
+    maxPositionLegs: 20,
+    maxExitLegsPerPosition: 10,
+    // Version string stored on every fill
+    rulesVersion: 'engine-1.0',
   },
   payout: {
     profitSplitPct: '80',
