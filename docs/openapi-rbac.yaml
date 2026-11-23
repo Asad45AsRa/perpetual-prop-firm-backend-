@@ -1,11 +1,27 @@
+# =====================================================================
+# FILE:   backend/docs/openapi-rbac.yaml   (REPLACE the existing file)
+# FOLDER: backend/docs/
+# LIVE DATA ONLY: every market, price, order book, trade and candle described here is served
+# from the live Hyperliquid feed through our backend. There is no mock, fake, sample or
+# placeholder data anywhere in this API. Examples below only show the SHAPE of a response.
+# =====================================================================
 openapi: 3.0.3
 info:
   title: Perpetual Prop Firm API - Auth, RBAC, Markets & Trading
-  version: 2.1.0
+  version: 2.2.0
   description: |
     **Scope now: authentication, RBAC, Hyperliquid market data, the trading engine and admin market management.**
     Payments, payouts, affiliate and the other admin feature endpoints are still left out of this file (kept commented
     at the bottom) and will be documented when they are wired.
+
+    ### What is new in 2.2.0 (Terminal market data)
+    - **New public routes under `/api/v1/terminal`** for the trading terminal: `bootstrap`, `markets`, `markets/{symbol}`,
+      `markets/{symbol}/book` (depth + price grouping), `markets/{symbol}/trades` and `markets/{symbol}/candles`.
+    - Everything is LIVE Hyperliquid data kept in memory by the backend: 24h change, 24h volume, open interest, premium,
+      funding, public trades and candles. A value is `null` until Hyperliquid has sent it. Nothing is simulated or filled in.
+    - The WebSocket `/ws/market` got the channels `trades` and `candles`, per-client book `depth` / `group`, per-channel symbol
+      lists and the 24h statistics inside every `price` message.
+    - Account data (positions, orders, fills) is unchanged and stays under `/api/v1/trading`.
 
     ### What is new in 2.1.0 (Hyperliquid + trading engine)
     - **Hyperliquid is used for market data only, and only from our backend.** Browsers never call Hyperliquid:
@@ -79,11 +95,29 @@ info:
 
     ## Market data WebSocket
     `ws://host/ws/market` (no cookie needed, public data). Updates are coalesced per symbol (`WS_PUSH_INTERVAL_MS`, default 250 ms).
-    - Server to client: `hello` `{symbols, intervalMs}`, `price` `{symbol, price, bid, ask, mark, oracle, fundingRate, bookFresh, markFresh, fresh, ts}`,
-      `book` `{symbol, bids, asks, seq, ts}` (top 10 levels, only if subscribed), `feed` `{symbol, fresh, bookFresh, markFresh}`
-      (sent only when freshness changes), `pong`.
-    - Client to server: `{"op":"subscribe","symbols":["BTC"],"channels":["price","book"]}` (default: all symbols, `price` only),
-      `{"op":"unsubscribe","symbols":["BTC"],"channels":["book"]}`, `{"op":"ping"}`.
+    Channels: `price` (default, every symbol), `book`, `trades`, `candles`.
+    - Server to client:
+      - `hello` `{symbols, intervalMs, channels, candleIntervals}`
+      - `price` `{symbol, price, bid, ask, mark, oracle, fundingRate, bookFresh, markFresh, fresh, ts, prevDayPx, change24h, change24hPct,
+        volume24hUsd, openInterest, openInterestUsd, premium, nextFundingAt}`
+      - `book` `{symbol, bids, asks, seq, ts, depth, group}` (full snapshot, only if subscribed; rows are `[price, size]`)
+      - `trades` `{symbol, snapshot, trades:[{price, size, side, time, tid}]}` newest first. `snapshot: true` is the recent history
+        sent right after subscribing, later messages contain new trades only.
+      - `candle` `{symbol, interval, t, T, o, h, l, c, v, n}`. The same `t` updates the forming candle, a new `t` is a new candle.
+      - `feed` `{symbol, fresh, bookFresh, markFresh}` (sent only when freshness changes)
+      - `error` `{code}` with `INVALID_JSON`, `SYMBOL_REQUIRED`, `INVALID_INTERVAL`, `UNKNOWN_SYMBOL`, `TOO_MANY_CANDLE_STREAMS`
+        (max 6 candle streams per connection)
+      - `pong`
+    - Client to server:
+      - `{"op":"subscribe","channels":["book","trades"],"symbols":["BTC"],"depth":15,"group":"1"}`
+        (`depth` 1-20, `group` = price step, empty string = raw levels)
+      - `{"op":"subscribe","channels":["candles"],"symbols":["BTC"],"interval":"1h"}` (`candles` needs `symbols` and `interval`)
+      - `{"op":"unsubscribe","channels":["book","trades"]}` switches the channels off and clears their symbol lists
+      - `{"op":"unsubscribe","channels":["candles"],"symbols":["BTC"],"interval":"1h"}`
+      - `{"op":"ping"}`
+    - The symbol list of a message applies only to the channels named in that message (to `price`, `book` and `trades` when no channel
+      is named). A terminal therefore keeps `price` for every market (markets table) and asks `book` + `trades` for the selected market only.
+    - Live candle streams are opened on Hyperliquid only while a browser needs them and are released when the socket closes.
 
     ## Guards
     Each operation shows its guard in `x-rbac`: `public`, `customer`, `staff`, `super_admin`,
@@ -104,6 +138,8 @@ tags:
     description: Trader / affiliate dashboard access for customers.
   - name: Markets
     description: Public Hyperliquid-backed market data (prices, order book, feed health). Served by our backend only.
+  - name: Terminal
+    description: Public live market data for the trading terminal (markets table, market bar, order book with grouping, trades, candles). Served by our backend only.
   - name: Trading
     description: Trader terminal. Orders, positions and account history. Portal `TRADER` + ownership of the account.
   - name: Admin markets
@@ -477,6 +513,95 @@ components:
         symbols:
           type: array
           items: { type: object, additionalProperties: true, description: Per symbol age of book / mark and freshness. }
+    CandleInterval:
+      type: string
+      enum: ['1m', '3m', '5m', '15m', '30m', '1h', '2h', '4h', '8h', '12h', '1d', '3d', '1w', '1M']
+    Candle:
+      type: object
+      description: One OHLCV candle from Hyperliquid. Short keys on purpose (a chart loads thousands of rows).
+      properties:
+        t: { type: integer, description: 'Open time, Unix ms.' }
+        T: { type: integer, description: 'Close time, Unix ms.' }
+        o: { type: string }
+        h: { type: string }
+        l: { type: string }
+        c: { type: string }
+        v: { type: string, description: Volume in the base asset. }
+        n: { type: integer, description: Number of trades in the candle. }
+    TerminalMarket:
+      description: |
+        A market for the terminal: everything of `Market` plus 24h statistics, caps, fee rates and the offered book groups.
+        Statistics are `null` until Hyperliquid has sent them.
+      allOf:
+        - $ref: '#/components/schemas/Market'
+        - type: object
+          properties:
+            positionCapUsd: { type: string, nullable: true, description: Max open notional per symbol and side (same value as `maxNotionalUsd`). }
+            makerFeeRate: { type: string, description: 'Rate of notional, 0.0001 = 0.01 %.' }
+            takerFeeRate: { type: string }
+            bookGroups: { type: array, items: { type: string }, description: 'Price steps the order book can be grouped by, smallest first.' }
+            prevDayPx: { type: string, nullable: true, description: Price 24 hours ago. }
+            change24h: { type: string, nullable: true, description: Mark (or mid) minus prevDayPx. }
+            change24hPct: { type: string, nullable: true, description: 'Percent, 4 decimals.' }
+            volume24hUsd: { type: string, nullable: true }
+            openInterest: { type: string, nullable: true, description: In base asset units. }
+            openInterestUsd: { type: string, nullable: true }
+            premium: { type: string, nullable: true }
+            nextFundingAt: { type: integer, description: 'Next full UTC hour (Hyperliquid pays funding hourly), Unix ms.' }
+    TerminalBook:
+      type: object
+      description: Rows are `[price, size]`, best first. Grouping rounds bids DOWN and asks UP, so the spread is never made to look tighter.
+      properties:
+        symbol: { type: string }
+        group: { type: string, nullable: true, description: 'Applied price step, null = raw levels.' }
+        groups: { type: array, items: { type: string }, description: Price steps to offer in the UI. }
+        bids: { type: array, items: { type: array, items: { type: string }, minItems: 2, maxItems: 2 } }
+        asks: { type: array, items: { type: array, items: { type: string }, minItems: 2, maxItems: 2 } }
+        spread: { type: string, nullable: true, description: Spread of the REAL book (not the grouped one). }
+        spreadPct: { type: string, nullable: true }
+        fresh: { type: boolean }
+        seq: { type: integer }
+        ts: { type: integer }
+    TerminalTrade:
+      type: object
+      properties:
+        price: { type: string }
+        size: { type: string }
+        side: { type: string, enum: [BUY, SELL], description: Side of the aggressor (taker). }
+        time: { type: integer, description: 'Exchange time, Unix ms.' }
+        tid: { type: string, description: Trade id. }
+    TerminalTrades:
+      type: object
+      properties:
+        symbol: { type: string }
+        trades: { type: array, items: { $ref: '#/components/schemas/TerminalTrade' }, description: Newest first. }
+        ts: { type: integer }
+    TerminalCandles:
+      type: object
+      properties:
+        symbol: { type: string }
+        interval: { $ref: '#/components/schemas/CandleInterval' }
+        candles: { type: array, items: { $ref: '#/components/schemas/Candle' }, description: Oldest first. }
+        ts: { type: integer }
+    TerminalBootstrap:
+      type: object
+      description: Everything the terminal needs for its first paint in one response.
+      properties:
+        serverTime: { type: integer }
+        selectedSymbol: { type: string }
+        markets: { type: array, items: { $ref: '#/components/schemas/TerminalMarket' } }
+        book: { type: object, allOf: [{ $ref: '#/components/schemas/TerminalBook' }], nullable: true, description: null until the first book has arrived. }
+        trades: { type: array, items: { $ref: '#/components/schemas/TerminalTrade' } }
+        chart:
+          type: object
+          properties:
+            intervals: { type: array, items: { $ref: '#/components/schemas/CandleInterval' } }
+            defaultInterval: { $ref: '#/components/schemas/CandleInterval' }
+        ws:
+          type: object
+          properties:
+            path: { type: string, example: /ws/market }
+            channels: { type: array, items: { type: string } }
     PlaceOrderRequest:
       type: object
       required: [symbol, side]
@@ -1255,6 +1380,100 @@ paths:
         '200': { description: Book, content: { application/json: { schema: { $ref: '#/components/schemas/OrderBook' } } } }
         '404': { $ref: '#/components/responses/NotFound' }
         '422': { description: NO_PRICE - no order book yet., content: { application/json: { schema: { $ref: '#/components/schemas/Error' } } } }
+
+  # ---------------------------------------------------------------- Terminal
+  /api/v1/terminal/bootstrap:
+    get:
+      tags: [Terminal]
+      summary: First paint of the terminal in one request
+      description: Markets table, selected market, order book, recent trades and chart settings. An unknown or missing `symbol` falls back to the first enabled market. A market without data yet gives a null book and an empty trades list instead of an error.
+      x-rbac: public
+      security: []
+      parameters:
+        - { name: symbol, in: query, required: false, schema: { type: string, maxLength: 20 } }
+      responses:
+        '200': { description: Bootstrap, content: { application/json: { schema: { $ref: '#/components/schemas/TerminalBootstrap' } } } }
+        '400': { $ref: '#/components/responses/BadRequest' }
+        '404': { description: No market is enabled., content: { application/json: { schema: { $ref: '#/components/schemas/Error' } } } }
+  /api/v1/terminal/markets:
+    get:
+      tags: [Terminal]
+      summary: Markets table (live price, 24h change, volume, open interest, funding, leverage, fees)
+      x-rbac: public
+      security: []
+      responses:
+        '200':
+          description: Enabled markets
+          content:
+            application/json:
+              schema:
+                type: object
+                properties:
+                  markets: { type: array, items: { $ref: '#/components/schemas/TerminalMarket' } }
+                  serverTime: { type: integer }
+  /api/v1/terminal/markets/{symbol}:
+    get:
+      tags: [Terminal]
+      summary: One market (market bar)
+      x-rbac: public
+      security: []
+      parameters: [{ $ref: '#/components/parameters/SymbolParam' }]
+      responses:
+        '200': { description: Market, content: { application/json: { schema: { $ref: '#/components/schemas/TerminalMarket' } } } }
+        '404': { $ref: '#/components/responses/NotFound' }
+  /api/v1/terminal/markets/{symbol}/book:
+    get:
+      tags: [Terminal]
+      summary: Order book with depth and price grouping
+      description: Levels come from the live Hyperliquid book (20 raw levels per side), so a very large `group` returns fewer rows. Use the `groups` list of the response to offer sensible steps.
+      x-rbac: public
+      security: []
+      parameters:
+        - { $ref: '#/components/parameters/SymbolParam' }
+        - { name: depth, in: query, schema: { type: integer, minimum: 1, maximum: 20, default: 15 } }
+        - { name: group, in: query, description: 'Price step as a positive decimal string, for example `10`. Omit for raw levels.', schema: { type: string, pattern: '^\d+(\.\d+)?$' } }
+      responses:
+        '200': { description: Book, content: { application/json: { schema: { $ref: '#/components/schemas/TerminalBook' } } } }
+        '400': { $ref: '#/components/responses/BadRequest' }
+        '404': { $ref: '#/components/responses/NotFound' }
+        '422': { description: NO_PRICE - no order book received yet., content: { application/json: { schema: { $ref: '#/components/schemas/Error' } } } }
+  /api/v1/terminal/markets/{symbol}/trades:
+    get:
+      tags: [Terminal]
+      summary: Latest public trades (newest first)
+      description: Kept in memory only (last 200 per symbol), so the tape starts empty after a backend restart and fills from the live feed.
+      x-rbac: public
+      security: []
+      parameters:
+        - { $ref: '#/components/parameters/SymbolParam' }
+        - { name: limit, in: query, schema: { type: integer, minimum: 1, maximum: 200, default: 50 } }
+      responses:
+        '200': { description: Trades, content: { application/json: { schema: { $ref: '#/components/schemas/TerminalTrades' } } } }
+        '400': { $ref: '#/components/responses/BadRequest' }
+        '404': { $ref: '#/components/responses/NotFound' }
+  /api/v1/terminal/markets/{symbol}/candles:
+    get:
+      tags: [Terminal]
+      summary: Chart history (oldest first)
+      description: Loaded from Hyperliquid through our backend. Identical requests share one Hyperliquid call and are cached for 2 s (finished history 60 s). The forming candle is updated over the WebSocket channel `candles`.
+      x-rbac: public
+      security: []
+      parameters:
+        - { $ref: '#/components/parameters/SymbolParam' }
+        - { name: interval, in: query, schema: { $ref: '#/components/schemas/CandleInterval' } }
+        - { name: startTime, in: query, description: Unix ms., schema: { type: integer, minimum: 1 } }
+        - { name: endTime, in: query, description: Unix ms., schema: { type: integer, minimum: 1 } }
+        - { name: limit, in: query, schema: { type: integer, minimum: 1, maximum: 5000, default: 500 } }
+      responses:
+        '200': { description: Candles, content: { application/json: { schema: { $ref: '#/components/schemas/TerminalCandles' } } } }
+        '400': { description: 'Validation failed, unsupported interval, or startTime not before endTime.', content: { application/json: { schema: { $ref: '#/components/schemas/Error' } } } }
+        '404': { $ref: '#/components/responses/NotFound' }
+        '502':
+          description: Hyperliquid candle data is temporarily unavailable.
+          content:
+            application/json:
+              schema: { $ref: '#/components/schemas/Error' }
+              example: { code: MARKET_DATA_UNAVAILABLE, message: Candle data is temporarily unavailable, requestId: 3f0c... }
 
   # ----------------------------------------------------------------- Trading
   /api/v1/trading/accounts:

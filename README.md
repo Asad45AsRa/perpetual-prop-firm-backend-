@@ -83,21 +83,8 @@ backend/
   tests/                   Unit tests for formulas, risk rules, Plisio signature
 ```
 
-## 3. The nine steps and where they live
 
-| Step | Topic | Files |
-|---|---|---|
-| 1 | Project setup, env, logging, tests, staging/prod | `package.json`, `src/config/*`, `.env.*.example`, `vitest.config.ts`, `.github/workflows/ci.yml` |
-| 2 | Database | `prisma/schema.prisma` |
-| 3 | Auth and users | `src/modules/auth/*`, `src/middleware/auth.ts` |
-| 4 | Market data | `src/modules/markets/*` (BTC and ETH first via `LAUNCH_SYMBOLS`) |
-| 5 | Trading engine | `src/modules/trading/*`, `src/modules/ledger/*` |
-| 6 | Risk and evaluation | `src/modules/risk/*` |
-| 7 | Payments | `src/modules/payments/*` |
-| 8 | Payouts, affiliates, admin | `src/modules/payouts`, `affiliates`, `admin` |
-| 9 | Jobs and launch prep | `src/jobs/index.ts`, `/health` |
-
-## 4. Key design rules
+## 3. Key design rules
 
 - **Decimals only.** Money, prices and sizes are `Decimal` in the database and `decimal.js` in code.
 - **Ledger first.** `TradingAccount.balance` is changed only by `ledger.service.ts`, which writes an append-only
@@ -113,7 +100,7 @@ backend/
 - **Admin security.** Staff must pass MFA (TOTP). The first super admin is protected and cannot be deleted; it creates
   admins/moderators and grants sections one by one. Deleted staff cannot log in and their sessions are revoked.
 
-## 5. API overview (prefix `/api/v1`)
+## 4. API overview (prefix `/api/v1`)
 
 Public: `GET /plans`, `GET /markets`, `GET /markets/:symbol/price`, `GET /payouts/public`, `GET /content/faq`,
 `GET /content/rules`, `POST /auth/signup|verify-email|login|refresh|logout|forgot-password|reset-password`,
@@ -143,7 +130,7 @@ POST /api/v1/trading/accounts/<accountId>/orders
 
 Errors always look like `{ "code": "...", "message": "...", "requestId": "...", "details": ... }`.
 
-## 6. First-run flow
+## 5. First-run flow
 
 1. `npm run db:seed` creates the super admin from `.env` (and placeholder plans).
 2. Log in with `POST /auth/login`. The response has `mfaSetupRequired: true`.
@@ -151,7 +138,7 @@ Errors always look like `{ "code": "...", "message": "...", "requestId": "...", 
 4. Use the returned access token for `/admin/...` routes. Future logins return `mfaRequired` + `mfaToken`; send them
    with the 6-digit code to `POST /auth/mfa/verify`.
 
-## 7. Not finished yet (next steps)
+## 6. Not finished yet (next steps)
 
 - Advanced orders (Scale, TWAP, Chase Limit, Pair Trading, Reverse): phase 2 in the product spec.
 - Account-level WebSocket (private fills / positions push). Prices are pushed; account data is polled through the REST API.
@@ -161,7 +148,7 @@ Errors always look like `{ "code": "...", "message": "...", "requestId": "...", 
 - Database integration tests, load tests for 106 symbols, backups and recovery runbook, Redis queue if needed.
 - Marking each market's trading hours and non-crypto symbols (current sync only reads `LAUNCH_SYMBOLS`).
 
-## 8. Decisions to confirm with the client
+## 7. Decisions to confirm with the client
 
 Account sizes and prices, profit target, daily-loss method (`BALANCE_BASED` or `EQUITY_BASED`), drawdown type
 (`STATIC` or `TRAILING`), daily reset hour (`DAILY_RESET_UTC_HOUR`), leverage caps, fees/funding, payout minimum and

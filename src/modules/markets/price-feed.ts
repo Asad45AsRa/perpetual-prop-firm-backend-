@@ -5,18 +5,31 @@ import { logger } from '../../config/logger';
 import { Decimal } from '../../utils/decimal';
 import type { BookLevel, BookSnapshot } from '../trading/engine/orderbook';
 import { bestAsk, bestBid, midPrice } from '../trading/engine/orderbook';
-import { fetchL2Book, fetchMetaAndAssetCtxs, type HlAssetCtx, type HlL2Book, type HlLevel } from './hyperliquid.client';
+import {
+  fetchL2Book,
+  fetchMetaAndAssetCtxs,
+  type CandleInterval,
+  type HlAssetCtx,
+  type HlCandle,
+  type HlL2Book,
+  type HlLevel,
+  type HlTrade,
+} from './hyperliquid.client';
 
 // =====================================================================
 // Live market data from Hyperliquid, kept in memory.
 //   * l2Book          -> order book (bids / asks with depth), used for execution
 //   * activeAssetCtx  -> mark price, oracle price, funding rate, used for PnL and funding
+//                        (also 24h volume, open interest and previous day price for the terminal market bar)
+//   * trades          -> public trade tape shown in the terminal (last TRADE_BUFFER_SIZE trades per symbol)
+//   * candle          -> live candle updates, subscribed ON DEMAND per (symbol, interval) with reference counting
 // Both streams are monitored SEPARATELY: a fresh mark with a stale book (or the other way round)
 // still blocks trading, because neither a fill price nor the account risk can be trusted.
 // A REST snapshot is loaded on startup and after every reconnect. A watchdog reconnects a socket
 // that went silent without closing.
 //
-// Events: "book" (BookSnapshot), "mark" (MarkInfo), "price" (PriceTick, after every update).
+// Events: "book" (BookSnapshot), "mark" (MarkInfo), "price" (PriceTick, after every update),
+//         "trades" (symbol, TradeTick[]), "candle" (CandleTick).
 // =====================================================================
 
 export interface MarkInfo {
@@ -25,7 +38,40 @@ export interface MarkInfo {
   oracle: Decimal;
   // Current hourly funding rate estimate published by Hyperliquid
   funding: Decimal | null;
+  // Terminal statistics from the same activeAssetCtx message (null when Hyperliquid did not send them)
+  prevDayPx: Decimal | null;
+  // 24h traded notional in USD
+  dayNtlVlm: Decimal | null;
+  // Open interest in base asset units (multiply by mark for USD)
+  openInterest: Decimal | null;
+  premium: Decimal | null;
   receivedAt: number;
+}
+
+// One public trade, normalised. side is the side of the AGGRESSOR (taker).
+export interface TradeTick {
+  symbol: string;
+  price: Decimal;
+  size: Decimal;
+  side: 'BUY' | 'SELL';
+  // Exchange timestamp in milliseconds
+  time: number;
+  tid: string;
+}
+
+// One candle, normalised (all numbers kept as Decimal until the JSON boundary).
+export interface CandleTick {
+  symbol: string;
+  interval: CandleInterval;
+  // Open time and close time in milliseconds
+  openTime: number;
+  closeTime: number;
+  open: Decimal;
+  high: Decimal;
+  low: Decimal;
+  close: Decimal;
+  volume: Decimal;
+  trades: number;
 }
 
 // Compact "latest price" view used by routes, the WebSocket push and the risk engine.
@@ -53,6 +99,19 @@ const WATCHDOG_INTERVAL_MS = 5_000;
 const CTX_POLL_INTERVAL_MS = 5_000;
 // The REST fallback only runs when the websocket mark is this old
 const CTX_POLL_WHEN_OLDER_THAN_MS = 4_000;
+// Public trades kept in memory per symbol (newest last)
+const TRADE_BUFFER_SIZE = 200;
+
+// Optional numeric field of a Hyperliquid context: missing, empty or invalid values become null.
+function optionalDecimal(value: string | null | undefined): Decimal | null {
+  if (value == null || value === '') return null;
+  try {
+    const d = new Decimal(value);
+    return d.isFinite() ? d : null;
+  } catch {
+    return null;
+  }
+}
 
 // Converts raw Hyperliquid levels into sorted, validated levels. Bad rows are skipped.
 function parseLevels(raw: HlLevel[] | undefined, side: 'BID' | 'ASK'): BookLevel[] {
@@ -78,6 +137,12 @@ class PriceFeed extends EventEmitter {
   // symbol -> Hyperliquid coin key
   private tracked = new Map<string, string>();
   private coinToSymbol = new Map<string, string>();
+  // symbol -> last trades (oldest first)
+  private trades = new Map<string, TradeTick[]>();
+  // "SYMBOL|interval" -> live candle subscription with the number of interested consumers
+  private candleSubs = new Map<string, { symbol: string; coin: string; interval: CandleInterval; refs: number }>();
+  // "SYMBOL|interval" -> newest candle received from the stream
+  private latestCandles = new Map<string, CandleTick>();
 
   private pingTimer: NodeJS.Timeout | null = null;
   private watchdogTimer: NodeJS.Timeout | null = null;
@@ -123,11 +188,46 @@ class PriceFeed extends EventEmitter {
     if (!coin) return;
     this.send({ method: 'unsubscribe', subscription: { type: 'l2Book', coin } });
     this.send({ method: 'unsubscribe', subscription: { type: 'activeAssetCtx', coin } });
+    this.send({ method: 'unsubscribe', subscription: { type: 'trades', coin } });
+    for (const [key, sub] of [...this.candleSubs]) {
+      if (sub.symbol !== symbol) continue;
+      this.send({ method: 'unsubscribe', subscription: { type: 'candle', coin, interval: sub.interval } });
+      this.candleSubs.delete(key);
+      this.latestCandles.delete(key);
+    }
     this.tracked.delete(symbol);
     this.coinToSymbol.delete(coin);
     // A market that is no longer tracked must not keep a price that can look fresh
     this.books.delete(symbol);
     this.marks.delete(symbol);
+    this.trades.delete(symbol);
+  }
+
+  // Live candles on demand. Every call must be paired with one unsubscribeCandle call.
+  // The Hyperliquid subscription exists while at least one consumer needs it.
+  subscribeCandle(symbol: string, interval: CandleInterval): boolean {
+    const coin = this.tracked.get(symbol);
+    if (!coin) return false;
+    const key = `${symbol}|${interval}`;
+    const existing = this.candleSubs.get(key);
+    if (existing) {
+      existing.refs++;
+      return true;
+    }
+    this.candleSubs.set(key, { symbol, coin, interval, refs: 1 });
+    this.send({ method: 'subscribe', subscription: { type: 'candle', coin, interval } });
+    return true;
+  }
+
+  unsubscribeCandle(symbol: string, interval: CandleInterval) {
+    const key = `${symbol}|${interval}`;
+    const sub = this.candleSubs.get(key);
+    if (!sub) return;
+    sub.refs--;
+    if (sub.refs > 0) return;
+    this.send({ method: 'unsubscribe', subscription: { type: 'candle', coin: sub.coin, interval } });
+    this.candleSubs.delete(key);
+    this.latestCandles.delete(key);
   }
 
   // ------------------------------- readers -------------------------------
@@ -138,6 +238,21 @@ class PriceFeed extends EventEmitter {
 
   getMark(symbol: string): MarkInfo | undefined {
     return this.marks.get(symbol);
+  }
+
+  // Newest trades first, at most "limit" rows.
+  getTrades(symbol: string, limit = 50): TradeTick[] {
+    const list = this.trades.get(symbol) ?? [];
+    return list.slice(-limit).reverse();
+  }
+
+  getLatestCandle(symbol: string, interval: CandleInterval): CandleTick | undefined {
+    return this.latestCandles.get(`${symbol}|${interval}`);
+  }
+
+  // Symbol and exact Hyperliquid coin key for a tracked symbol (used by the REST candle loader).
+  getCoin(symbol: string): string | undefined {
+    return this.tracked.get(symbol);
   }
 
   isBookFresh(symbol: string, now = Date.now()): boolean {
@@ -188,6 +303,7 @@ class PriceFeed extends EventEmitter {
       lastMessageAgeMs: this.lastMessageAt ? now - this.lastMessageAt : null,
       reconnects: this.reconnects,
       droppedOutOfOrder: this.droppedOutOfOrder,
+      candleSubscriptions: [...this.candleSubs.values()].map((c) => ({ symbol: c.symbol, interval: c.interval, consumers: c.refs })),
       limits: { staleBookMs, staleMarkMs },
       symbols: [...this.tracked.keys()].map((symbol) => {
         const book = this.books.get(symbol);
@@ -198,6 +314,7 @@ class PriceFeed extends EventEmitter {
           markAgeMs: mark ? now - mark.receivedAt : null,
           bookFresh: this.isBookFresh(symbol, now),
           markFresh: this.isMarkFresh(symbol, now),
+          bufferedTrades: this.trades.get(symbol)?.length ?? 0,
         };
       }),
     };
@@ -231,7 +348,11 @@ class PriceFeed extends EventEmitter {
     return true;
   }
 
-  ingestMark(symbol: string, ctx: Pick<HlAssetCtx, 'markPx' | 'oraclePx' | 'funding'>, now = Date.now()): boolean {
+  ingestMark(
+    symbol: string,
+    ctx: Pick<HlAssetCtx, 'markPx' | 'oraclePx' | 'funding'> & Partial<Pick<HlAssetCtx, 'prevDayPx' | 'dayNtlVlm' | 'openInterest' | 'premium'>>,
+    now = Date.now(),
+  ): boolean {
     try {
       const mark = new Decimal(ctx.markPx);
       const oracle = new Decimal(ctx.oraclePx);
@@ -241,11 +362,74 @@ class PriceFeed extends EventEmitter {
         mark,
         oracle,
         funding: ctx.funding != null && ctx.funding !== '' ? new Decimal(ctx.funding) : null,
+        prevDayPx: optionalDecimal(ctx.prevDayPx),
+        dayNtlVlm: optionalDecimal(ctx.dayNtlVlm),
+        openInterest: optionalDecimal(ctx.openInterest),
+        premium: optionalDecimal(ctx.premium),
         receivedAt: now,
       };
       this.marks.set(symbol, info);
       this.emit('mark', info);
       this.emitPrice(symbol);
+      return true;
+    } catch {
+      return false;
+    }
+  }
+
+  // Public trades. Duplicates (same trade id, e.g. the snapshot after a reconnect) are ignored.
+  // Returns the trades that were actually added, oldest first.
+  ingestTrades(symbol: string, raw: HlTrade[]): TradeTick[] {
+    if (!Array.isArray(raw) || raw.length === 0) return [];
+    const list = this.trades.get(symbol) ?? [];
+    const known = new Set(list.map((t) => t.tid));
+    const added: TradeTick[] = [];
+
+    for (const row of raw) {
+      try {
+        const tid = String(row.tid ?? row.hash ?? '');
+        const price = new Decimal(row.px);
+        const size = new Decimal(row.sz);
+        if (!tid || known.has(tid) || price.lte(0) || size.lte(0) || typeof row.time !== 'number') continue;
+        known.add(tid);
+        added.push({ symbol, price, size, side: row.side === 'B' ? 'BUY' : 'SELL', time: row.time, tid });
+      } catch {
+        // ignore a malformed trade
+      }
+    }
+    if (added.length === 0) return [];
+
+    added.sort((a, b) => a.time - b.time);
+    const merged = [...list, ...added].sort((a, b) => a.time - b.time).slice(-TRADE_BUFFER_SIZE);
+    this.trades.set(symbol, merged);
+    this.emit('trades', symbol, added);
+    return added;
+  }
+
+  // One live candle update. Returns false for malformed rows or an interval nobody asked for.
+  ingestCandle(symbol: string, raw: HlCandle): boolean {
+    try {
+      const interval = raw.i as CandleInterval;
+      const key = `${symbol}|${interval}`;
+      if (!this.candleSubs.has(key)) return false;
+      const candle: CandleTick = {
+        symbol,
+        interval,
+        openTime: Number(raw.t),
+        closeTime: Number(raw.T),
+        open: new Decimal(raw.o),
+        high: new Decimal(raw.h),
+        low: new Decimal(raw.l),
+        close: new Decimal(raw.c),
+        volume: new Decimal(raw.v),
+        trades: Number(raw.n) || 0,
+      };
+      if (!Number.isFinite(candle.openTime) || !Number.isFinite(candle.closeTime) || candle.open.lte(0) || candle.close.lte(0)) return false;
+      // A candle older than the newest one we hold is a replay: ignore it
+      const latest = this.latestCandles.get(key);
+      if (latest && candle.openTime < latest.openTime) return false;
+      this.latestCandles.set(key, candle);
+      this.emit('candle', candle);
       return true;
     } catch {
       return false;
@@ -275,6 +459,10 @@ class PriceFeed extends EventEmitter {
       this.attempts = 0;
       this.lastMessageAt = Date.now();
       for (const coin of this.tracked.values()) this.subscribe(coin);
+      // Live candle streams that consumers still need are restored after a reconnect
+      for (const sub of this.candleSubs.values()) {
+        this.send({ method: 'subscribe', subscription: { type: 'candle', coin: sub.coin, interval: sub.interval } });
+      }
       if (this.pingTimer) clearInterval(this.pingTimer);
       this.pingTimer = setInterval(() => this.send({ method: 'ping' }), PING_INTERVAL_MS);
       // Recovery: fill the cache from REST so we do not wait for the first tick
@@ -320,6 +508,7 @@ class PriceFeed extends EventEmitter {
   private subscribe(coin: string) {
     this.send({ method: 'subscribe', subscription: { type: 'l2Book', coin } });
     this.send({ method: 'subscribe', subscription: { type: 'activeAssetCtx', coin } });
+    this.send({ method: 'subscribe', subscription: { type: 'trades', coin } });
   }
 
   // REST snapshot of books and contexts (startup, reconnect, newly enabled market).
@@ -377,6 +566,21 @@ class PriceFeed extends EventEmitter {
       case 'activeAssetCtx': {
         const symbol = this.coinToSymbol.get(msg.data?.coin);
         if (symbol && msg.data?.ctx) this.ingestMark(symbol, msg.data.ctx);
+        return;
+      }
+      case 'trades': {
+        const rows: HlTrade[] = Array.isArray(msg.data) ? msg.data : [];
+        const symbol = this.coinToSymbol.get(rows[0]?.coin);
+        if (symbol) this.ingestTrades(symbol, rows);
+        return;
+      }
+      case 'candle': {
+        // Hyperliquid sends one candle or a list of candles, accept both
+        const rows: HlCandle[] = Array.isArray(msg.data) ? msg.data : msg.data ? [msg.data] : [];
+        for (const row of rows) {
+          const symbol = this.coinToSymbol.get(row?.s);
+          if (symbol) this.ingestCandle(symbol, row);
+        }
         return;
       }
       case 'error':

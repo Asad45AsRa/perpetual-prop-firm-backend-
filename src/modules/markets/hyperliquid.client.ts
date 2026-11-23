@@ -51,6 +51,40 @@ export interface HlFundingEntry {
   time: number;
 }
 
+// One OHLCV candle as sent by Hyperliquid (REST candleSnapshot and the WebSocket "candle" channel).
+export interface HlCandle {
+  // Open time and close time in milliseconds
+  t: number;
+  T: number;
+  // Coin and interval
+  s: string;
+  i: string;
+  // Open, close, high, low prices and volume (base asset), all strings
+  o: string;
+  c: string;
+  h: string;
+  l: string;
+  v: string;
+  // Number of trades inside the candle
+  n: number;
+}
+
+// One public trade as sent by the WebSocket "trades" channel.
+// side "B" = the buyer was the aggressor (taker buy), "A" = the seller was the aggressor.
+export interface HlTrade {
+  coin: string;
+  side: 'A' | 'B';
+  px: string;
+  sz: string;
+  time: number;
+  hash?: string;
+  tid: number | string;
+}
+
+// Candle intervals supported by Hyperliquid.
+export const CANDLE_INTERVALS = ['1m', '3m', '5m', '15m', '30m', '1h', '2h', '4h', '8h', '12h', '1d', '3d', '1w', '1M'] as const;
+export type CandleInterval = (typeof CANDLE_INTERVALS)[number];
+
 export class HyperliquidError extends Error {
   constructor(
     message: string,
@@ -144,5 +178,15 @@ export async function fetchL2Book(coin: string): Promise<HlL2Book> {
 export async function fetchFundingHistory(coin: string, startTime: number, endTime?: number): Promise<HlFundingEntry[]> {
   const json = await info<HlFundingEntry[]>({ type: 'fundingHistory', coin, startTime, ...(endTime ? { endTime } : {}) });
   if (!Array.isArray(json)) throw new HyperliquidError(`Hyperliquid fundingHistory response for ${coin} is malformed`);
+  return json;
+}
+
+// Historical candles of one coin. Hyperliquid returns at most the 5000 most recent candles of the range.
+export async function fetchCandles(coin: string, interval: CandleInterval, startTime: number, endTime?: number): Promise<HlCandle[]> {
+  const json = await info<HlCandle[]>({
+    type: 'candleSnapshot',
+    req: { coin, interval, startTime, ...(endTime ? { endTime } : {}) },
+  });
+  if (!Array.isArray(json)) throw new HyperliquidError(`Hyperliquid candleSnapshot response for ${coin} is malformed`);
   return json;
 }

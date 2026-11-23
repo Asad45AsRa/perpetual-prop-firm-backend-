@@ -21,6 +21,7 @@ import { contentRoutes } from './modules/content/content.routes';
 import { healthRoutes } from './modules/health/health.routes';
 import { marketRoutes } from './modules/markets/market.routes';
 import { marketWebSocket } from './modules/markets/market.ws';
+import { terminalRoutes } from './modules/markets/terminal.routes';
 import { paymentRoutes } from './modules/payments/payments.routes';
 import { payoutRoutes } from './modules/payouts/payouts.routes';
 import { planRoutes } from './modules/plans/plans.routes';
@@ -101,6 +102,8 @@ export async function buildApp() {
     await v1.register(rbacRoutes, { prefix: '/rbac' });
     await v1.register(planRoutes, { prefix: '/plans' });
     await v1.register(marketRoutes, { prefix: '/markets' });
+    // Trading terminal market data: bootstrap, markets table, book, trades, candles
+    await v1.register(terminalRoutes, { prefix: '/terminal' });
     await v1.register(tradingRoutes, { prefix: '/trading' });
     await v1.register(paymentRoutes, { prefix: '/payments' });
     await v1.register(payoutRoutes, { prefix: '/payouts' });
@@ -113,4 +116,5 @@ export async function buildApp() {
 
   return app;
 }
+
 ///
