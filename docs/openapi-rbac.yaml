@@ -1,10 +1,27 @@
 openapi: 3.0.3
 info:
-  title: Perpetual Prop Firm API - Auth & RBAC
-  version: 2.0.0
+  title: Perpetual Prop Firm API - Auth, RBAC, Markets & Trading
+  version: 2.1.0
   description: |
-    **Scope for now: authentication and RBAC only.** Trading, payments, payouts and admin feature endpoints
-    are left out of this file for the moment (kept commented at the bottom) and will be documented when they are wired.
+    **Scope now: authentication, RBAC, Hyperliquid market data, the trading engine and admin market management.**
+    Payments, payouts, affiliate and the other admin feature endpoints are still left out of this file (kept commented
+    at the bottom) and will be documented when they are wired.
+
+    ### What is new in 2.1.0 (Hyperliquid + trading engine)
+    - **Hyperliquid is used for market data only, and only from our backend.** Browsers never call Hyperliquid:
+      they use `GET /api/v1/markets/*` and the `ws://host/ws/market` WebSocket.
+    - Live feed: `l2Book` (order book depth) + `activeAssetCtx` (mark, oracle, funding) with REST snapshot on start/reconnect,
+      exponential reconnect, ping, silent-socket watchdog, crossed/empty book rejection and REST fallback for the mark price.
+    - **Stale prices block trading** (`MARKET_FEED_STALE`): the book must be fresh (`STALE_BOOK_MS`, default 5 s) AND the mark
+      price must be fresh (`STALE_MARK_MS`, default 10 s). Cancels still work while stale.
+    - **Order engine:** `MARKET` (walks the real book, VWAP), `LIMIT` (GTC / IOC, post-only), `STOP_MARKET`, `TAKE_PROFIT`,
+      `STOP_LOSS`, modify, cancel, cancel-all, close position, close-all, idempotent placement (`Idempotency-Key`).
+    - **Positions:** cross margin, `ONE_WAY` / `HEDGE` position modes, per-fill margin, PnL and fees posted through the ledger.
+    - **Fees:** maker/taker by market group (crypto 0.01 % / 0.04 %, equity 0 / 0.03 %, commodity / index / FX 0 / 0.005 %),
+      overridable per market. Fees are rounded up, signed amounts down.
+    - **Funding:** hourly (UTC) snapshot of open positions, posted once per position and hour when Hyperliquid publishes the rate.
+    - **Admin Markets:** sync from Hyperliquid, close-only, halt, notional limits, per-market fees, risk-tier versioning.
+    - New stable trading error codes (HTTP 422) the frontend can map to messages (see "Trading errors").
 
     Role-based access control for the three frontends: **trader dashboard**, **affiliate dashboard** and **admin panel**.
 
@@ -52,9 +69,25 @@ info:
     - `409` `CONFLICT` / `VERSION_CONFLICT` / `SELF_ACTION` / `SELF_DELETE`.
     - `429` `RATE_LIMITED` / `RESEND_COOLDOWN` (`details.retryInSeconds`) / `TOO_MANY_ATTEMPTS`.
 
+    ### Trading errors (HTTP 422, same `{ code, message, requestId, details? }` shape)
+    `MARKET_FEED_STALE`, `MARKET_DISABLED`, `MARKET_CLOSE_ONLY`, `TRADING_PAUSED`, `ACCOUNT_NOT_ACTIVE`, `INVALID_ORDER`, `INVALID_LOT`,
+    `INVALID_TICK`, `BELOW_MIN_NOTIONAL`, `LEVERAGE_CAP`, `INVALID_SLIPPAGE`, `VISIBLE_BOOK_TOO_THIN`, `OPEN_SLIPPAGE_EXCEEDED`,
+    `POST_ONLY_WOULD_TAKE`, `TRIGGER_WOULD_FIRE`, `POSITION_SIDE_REQUIRED`, `INVALID_POSITION_SIDE`, `NO_POSITION`, `REDUCE_ONLY`,
+    `REDUCE_ONLY_EXCESS`, `EXIT_LEG_LIMIT`, `EXIT_SIZE_EXCEEDS_POSITION`, `OPEN_ORDER_LIMIT`, `OPEN_POSITION_LIMIT`, `POSITION_CAP`,
+    `GROSS_EXPOSURE_CAP`, `INSUFFICIENT_MARGIN`, `POSITION_MODE_LOCKED`, `ORDER_ALREADY_FILLED`, `ORDER_NOT_ACTIVE`, and `NO_PRICE`
+    (no price/book received yet for a market).
+
+    ## Market data WebSocket
+    `ws://host/ws/market` (no cookie needed, public data). Updates are coalesced per symbol (`WS_PUSH_INTERVAL_MS`, default 250 ms).
+    - Server to client: `hello` `{symbols, intervalMs}`, `price` `{symbol, price, bid, ask, mark, oracle, fundingRate, bookFresh, markFresh, fresh, ts}`,
+      `book` `{symbol, bids, asks, seq, ts}` (top 10 levels, only if subscribed), `feed` `{symbol, fresh, bookFresh, markFresh}`
+      (sent only when freshness changes), `pong`.
+    - Client to server: `{"op":"subscribe","symbols":["BTC"],"channels":["price","book"]}` (default: all symbols, `price` only),
+      `{"op":"unsubscribe","symbols":["BTC"],"channels":["book"]}`, `{"op":"ping"}`.
+
     ## Guards
     Each operation shows its guard in `x-rbac`: `public`, `customer`, `staff`, `super_admin`,
-    `portal:<TRADER|AFFILIATE>` or `section:<key>:<level>` + `right:<key>`.
+    `portal:<TRADER|AFFILIATE>` (+ `ownership` = only your own trading account) or `section:<key>:<level>` + `right:<key>`.
 servers:
   - url: http://localhost:4000
     description: Local
@@ -69,7 +102,13 @@ tags:
     description: Super admin only. Matches the admin "Staff & Permissions" page.
   - name: Portals
     description: Trader / affiliate dashboard access for customers.
-  # - name: Route matrix   (commented for now: non auth/RBAC routes)
+  - name: Markets
+    description: Public Hyperliquid-backed market data (prices, order book, feed health). Served by our backend only.
+  - name: Trading
+    description: Trader terminal. Orders, positions and account history. Portal `TRADER` + ownership of the account.
+  - name: Admin markets
+    description: Market registry (sync from Hyperliquid, limits, fees, close-only, halt). Admin page `markets`.
+  # - name: Route matrix   (commented for now: other non auth/RBAC routes)
 
 components:
   securitySchemes:
@@ -117,12 +156,36 @@ components:
         application/json:
           schema: { $ref: '#/components/schemas/Error' }
           example: { code: RATE_LIMITED, message: Too many requests, requestId: 3f0c... }
+    Unprocessable:
+      description: A trading rule rejected the request (see "Trading errors" in the description for every `code`).
+      content:
+        application/json:
+          schema: { $ref: '#/components/schemas/Error' }
+          examples:
+            stale: { value: { code: MARKET_FEED_STALE, message: Live price is stale. Trading is paused for this market., requestId: 3f0c... } }
+            margin: { value: { code: INSUFFICIENT_MARGIN, message: Not enough available margin, requestId: 3f0c... } }
   parameters:
     IdParam:
       name: id
       in: path
       required: true
       schema: { type: string, format: uuid }
+    AccountIdParam:
+      name: accountId
+      in: path
+      required: true
+      schema: { type: string, format: uuid }
+    OrderIdParam:
+      name: orderId
+      in: path
+      required: true
+      schema: { type: string, format: uuid }
+    SymbolParam:
+      name: symbol
+      in: path
+      required: true
+      description: Case-insensitive (BTC, ETH, ...).
+      schema: { type: string }
   schemas:
     Error:
       type: object
@@ -229,7 +292,7 @@ components:
         leaderboardPublic: { type: boolean }
         portals: { type: array, items: { $ref: '#/components/schemas/Portal' } }
         referralCode: { type: string }
-        signupPlatform: { allOf: [{ $ref: '#/components/schemas/Platform' }], nullable: true }
+        signupPlatform: { type: string, nullable: true, allOf: [{ $ref: '#/components/schemas/Platform' }] }
         signupHandle: { type: string, nullable: true, description: Without the leading @. }
         createdAt: { type: string, format: date-time }
     SignInResult:
@@ -238,7 +301,7 @@ components:
       properties:
         user: { $ref: '#/components/schemas/CustomerUser' }
         isNewUser: { type: boolean }
-        needsProfile: { type: boolean, description: True until a username and avatar are set (onboarding steps 3 and 4). }
+        needsProfile: { type: boolean, description: 'True until a username and avatar are set (onboarding steps 3 and 4).' }
     CodeSent:
       type: object
       properties:
@@ -249,7 +312,7 @@ components:
       type: object
       properties:
         portal: { allOf: [{ $ref: '#/components/schemas/Portal' }], default: TRADER, description: Which sign-up page the person came from. }
-        referralCode: { type: string, description: From a referral link (new accounts only). }
+        referralCode: { type: string, description: 'From a referral link (new accounts only).' }
         platform: { allOf: [{ $ref: '#/components/schemas/Platform' }], description: Required when portal is AFFILIATE. }
         handle: { type: string, description: 'Social handle, e.g. @hafiz.trades. Required when portal is AFFILIATE.' }
     DeviceSession:
@@ -285,10 +348,10 @@ components:
           properties:
             status: { type: string, enum: [active, suspended] }
             twoFactor: { type: string, enum: [enabled, setup required] }
-            lastLoginAt: { type: string, description: ISO date, or "" if never. }
-            createdBy: { type: string, description: Email of the creator, or "". }
+            lastLoginAt: { type: string, description: 'ISO date, or "" if never.' }
+            createdBy: { type: string, description: 'Email of the creator, or "".' }
             createdAt: { type: string, format: date-time }
-            version: { type: integer, description: Send back as `ifVersion` when editing. }
+            version: { type: integer, description: 'Send back as `ifVersion` when editing.' }
     KillSwitches:
       type: object
       properties:
@@ -330,6 +393,285 @@ components:
           properties:
             admin: { $ref: '#/components/schemas/Preset' }
             moderator: { $ref: '#/components/schemas/Preset' }
+    # ----------------------------------------------- Markets & trading
+    Decimal:
+      type: string
+      pattern: '^\d+(\.\d+)?$'
+      description: Decimals travel as strings so no precision is lost in JSON.
+      example: '64250.5'
+    MarketType:
+      type: string
+      enum: [CRYPTO, EQUITY, COMMODITY, INDEX, FX]
+      description: Decides the fee group and the default leverage cap.
+    OrderSide: { type: string, enum: [BUY, SELL] }
+    PositionSide: { type: string, enum: [LONG, SHORT] }
+    PositionMode:
+      type: string
+      enum: [ONE_WAY, HEDGE]
+      description: ONE_WAY = one net position per market. HEDGE = independent long and short per market (`positionSide` required).
+    OrderType: { type: string, enum: [MARKET, LIMIT, STOP_MARKET, TAKE_PROFIT, STOP_LOSS] }
+    OrderStatus: { type: string, enum: [NEW, PARTIALLY_FILLED, FILLED, CANCELED, REJECTED] }
+    TimeInForce: { type: string, enum: [GTC, IOC] }
+    Liquidity: { type: string, enum: [MAKER, TAKER] }
+    LedgerType: { type: string, enum: [DEPOSIT, REALIZED_PNL, FEE, FUNDING, PAYOUT, ADJUSTMENT] }
+    Market:
+      type: object
+      description: Public shape of one market with its live data. `tradable` is the single flag the UI needs.
+      properties:
+        symbol: { type: string, example: BTC }
+        marketType: { $ref: '#/components/schemas/MarketType' }
+        maxLeverage: { type: integer, example: 10 }
+        maxNotionalUsd: { type: string, nullable: true, description: 'Max open notional per symbol and side, per account. null = no per-symbol cap.' }
+        minNotionalUsd: { type: string, example: '10' }
+        szDecimals: { type: integer }
+        pricePrecision: { type: integer }
+        priceTick: { type: string, description: 'Prices must be a multiple of this (max 5 significant figures).' }
+        sizeStep: { type: string, description: Order size must be a multiple of this. }
+        minSize: { type: string }
+        isHalted: { type: boolean }
+        isCloseOnly: { type: boolean, description: 'Existing positions can be reduced, no new exposure.' }
+        fundingSupported: { type: boolean }
+        price: { type: string, nullable: true, description: Mid price. }
+        bid: { type: string, nullable: true }
+        ask: { type: string, nullable: true }
+        mark: { type: string, nullable: true }
+        oracle: { type: string, nullable: true }
+        fundingRate: { type: string, nullable: true }
+        bookFresh: { type: boolean }
+        markFresh: { type: boolean }
+        priceFresh: { type: boolean, description: bookFresh AND markFresh. Trading is blocked while false. }
+        tradable: { type: boolean, description: enabled AND not halted AND not close-only AND priceFresh. }
+        updatedAt: { type: integer, nullable: true, description: Unix ms of the last tick. }
+    PriceTick:
+      type: object
+      properties:
+        symbol: { type: string }
+        price: { type: string }
+        bid: { type: string, nullable: true }
+        ask: { type: string, nullable: true }
+        mark: { type: string, nullable: true }
+        oracle: { type: string, nullable: true }
+        fundingRate: { type: string, nullable: true }
+        fresh: { type: boolean }
+        bookFresh: { type: boolean }
+        markFresh: { type: boolean }
+        ts: { type: integer, description: Unix ms. }
+    OrderBook:
+      type: object
+      description: Same data the engine fills against. Levels are `[price, size]`, best first.
+      properties:
+        symbol: { type: string }
+        bids: { type: array, items: { type: array, items: { type: string }, minItems: 2, maxItems: 2 } }
+        asks: { type: array, items: { type: array, items: { type: string }, minItems: 2, maxItems: 2 } }
+        fresh: { type: boolean }
+        seq: { type: integer }
+        ts: { type: integer }
+    FeedStatus:
+      type: object
+      properties:
+        connected: { type: boolean, description: Hyperliquid socket state. }
+        limits:
+          type: object
+          description: Active staleness limits in milliseconds.
+          additionalProperties: true
+        symbols:
+          type: array
+          items: { type: object, additionalProperties: true, description: Per symbol age of book / mark and freshness. }
+    PlaceOrderRequest:
+      type: object
+      required: [symbol, side]
+      description: |
+        | type | needs |
+        |---|---|
+        | `MARKET` (default) | `size`. Opening/adding/reversing needs the FULL size within the visible book and within `maxSlippagePct` (default 3 %). Closing orders may fill partly and have no slippage cap. |
+        | `LIMIT` | `size`, `limitPrice`. Crossing fills as taker (never above the limit), the rest rests (`GTC`) or is cancelled (`IOC`). Resting fills are maker at the limit price. `postOnly` rejects instead of taking. |
+        | `STOP_MARKET` | `size`, `triggerPrice`. Entry stop, reserves nothing; margin and caps are re-checked when it fires. |
+        | `TAKE_PROFIT` / `STOP_LOSS` | `triggerPrice` + `size` or `closePosition: true`. Reduce-only. Fires when the mark OR the executable side of the book touches the level. |
+      properties:
+        symbol: { type: string, minLength: 1, maxLength: 20, example: BTC }
+        side: { $ref: '#/components/schemas/OrderSide' }
+        type: { allOf: [{ $ref: '#/components/schemas/OrderType' }], default: MARKET }
+        size: { $ref: '#/components/schemas/Decimal' }
+        closePosition: { type: boolean, default: false, description: 'TP / SL that always closes the whole position (size follows the position).' }
+        limitPrice: { $ref: '#/components/schemas/Decimal' }
+        triggerPrice: { $ref: '#/components/schemas/Decimal' }
+        leverage: { type: integer, minimum: 1, maximum: 200, default: 1, description: 'Per order. Effective max = min(market, plan).' }
+        reduceOnly: { type: boolean, default: false }
+        postOnly: { type: boolean, default: false }
+        timeInForce: { allOf: [{ $ref: '#/components/schemas/TimeInForce' }], default: GTC }
+        positionSide: { $ref: '#/components/schemas/PositionSide' }
+        maxSlippagePct: { $ref: '#/components/schemas/Decimal' }
+        clientOrderId: { type: string, minLength: 1, maxLength: 64, description: 'Same as the `Idempotency-Key` header.' }
+    ModifyOrderRequest:
+      type: object
+      description: Send at least one field. The replacement is validated first, then the old order is cancelled in the same transaction.
+      minProperties: 1
+      properties:
+        size: { $ref: '#/components/schemas/Decimal' }
+        limitPrice: { $ref: '#/components/schemas/Decimal' }
+        triggerPrice: { $ref: '#/components/schemas/Decimal' }
+    Order:
+      type: object
+      properties:
+        id: { type: string, format: uuid }
+        accountId: { type: string, format: uuid }
+        symbol: { type: string, description: 'Present on list / detail responses (market.symbol).' }
+        side: { $ref: '#/components/schemas/OrderSide' }
+        type: { $ref: '#/components/schemas/OrderType' }
+        status: { $ref: '#/components/schemas/OrderStatus' }
+        size: { type: string }
+        limitPrice: { type: string, nullable: true }
+        triggerPrice: { type: string, nullable: true }
+        leverage: { type: integer }
+        reduceOnly: { type: boolean }
+        postOnly: { type: boolean }
+        timeInForce: { $ref: '#/components/schemas/TimeInForce' }
+        positionSide: { type: string, nullable: true, allOf: [{ $ref: '#/components/schemas/PositionSide' }] }
+        closePosition: { type: boolean }
+        maxSlippagePct: { type: string, nullable: true }
+        reservedMargin: { type: string, description: Margin + fee buffer held for the unfilled part of a resting opening order. }
+        triggeredAt: { type: string, format: date-time, nullable: true }
+        cancelReason: { type: string, nullable: true, example: USER_CANCEL_ALL }
+        clientOrderId: { type: string, nullable: true }
+        createdAt: { type: string, format: date-time }
+    Fill:
+      type: object
+      description: Every fill stores liquidity, fee rate, the book levels consumed, book time and the rules version (dispute proof).
+      properties:
+        id: { type: string, format: uuid }
+        orderId: { type: string, format: uuid }
+        symbol: { type: string }
+        side: { $ref: '#/components/schemas/OrderSide' }
+        positionSide: { type: string, nullable: true, allOf: [{ $ref: '#/components/schemas/PositionSide' }] }
+        size: { type: string }
+        price: { type: string }
+        fee: { type: string }
+        feeRate: { type: string }
+        liquidity: { $ref: '#/components/schemas/Liquidity' }
+        realizedPnl: { type: string }
+        bookLevels: { type: array, nullable: true, items: { type: array, items: { type: string } }, description: 'Consumed levels `[[price, size], ...]`.' }
+        bookTime: { type: string, format: date-time, nullable: true }
+        rulesVersion: { type: string, nullable: true, example: engine-1.0 }
+        createdAt: { type: string, format: date-time }
+    PlaceOrderResult:
+      type: object
+      properties:
+        order: { $ref: '#/components/schemas/Order' }
+        fills: { type: array, items: { $ref: '#/components/schemas/Fill' } }
+        fill: { type: string, nullable: true, allOf: [{ $ref: '#/components/schemas/Fill' }], description: 'First fill, or null.' }
+        duplicate: { type: boolean, description: 'true when the same Idempotency-Key / clientOrderId was already processed (HTTP 200).' }
+    LedgerEntry:
+      type: object
+      properties:
+        id: { type: string, format: uuid }
+        accountId: { type: string, format: uuid }
+        type: { $ref: '#/components/schemas/LedgerType' }
+        amount: { type: string, description: Signed. Positive credits the account. }
+        balanceAfter: { type: string }
+        refType: { type: string, nullable: true }
+        refId: { type: string, nullable: true }
+        description: { type: string, nullable: true }
+        createdAt: { type: string, format: date-time }
+    PositionView:
+      type: object
+      properties:
+        id: { type: string, format: uuid }
+        symbol: { type: string }
+        side: { $ref: '#/components/schemas/PositionSide' }
+        size: { type: string }
+        entryPrice: { type: string }
+        markPrice: { type: string }
+        notional: { type: string }
+        leverage: { type: integer }
+        margin: { type: string, description: 'Initial margin (notional / leverage per opening fill).' }
+        maintenanceMarginRef: { type: string, description: 'Reference only (IM / 2), never liquidates.' }
+        unrealizedPnl: { type: string }
+        liquidationPrice: { type: string, nullable: true, description: 'Always null (cross margin, no per-position liquidation price).' }
+    AccountOverview:
+      type: object
+      description: 'Cross margin. `equity = balance + unrealizedPnl`; `availableMargin = equity - marginUsed - reservedMargin`.'
+      properties:
+        id: { type: string, format: uuid }
+        stage: { type: string, enum: [CHALLENGE, FUNDED] }
+        status: { type: string, enum: [ACTIVE, PASSED, BREACHED, DISABLED] }
+        positionMode: { $ref: '#/components/schemas/PositionMode' }
+        startingBalance: { type: string }
+        balance: { type: string }
+        unrealizedPnl: { type: string }
+        equity: { type: string }
+        marginUsed: { type: string }
+        reservedMargin: { type: string, description: Margin reserved by working orders. }
+        freeMargin: { type: string }
+        availableMargin: { type: string }
+        maintenanceMarginRef: { type: string }
+        grossExposure: { type: string }
+        grossExposureLimit: { type: string, description: 'grossExposureMultiple (default 10) x equity.' }
+        overCap: { type: boolean, description: 'Above the cap: new exposure is blocked, reducing is allowed (GROSS_EXPOSURE_CAP).' }
+        positions: { type: array, items: { $ref: '#/components/schemas/PositionView' } }
+    ClosePositionRequest:
+      type: object
+      properties:
+        size: { $ref: '#/components/schemas/Decimal' }
+        positionSide: { $ref: '#/components/schemas/PositionSide' }
+    CloseAllResult:
+      type: object
+      description: Each market is its own transaction, so a thin book on one market never blocks the others.
+      properties:
+        results:
+          type: array
+          items:
+            type: object
+            properties:
+              symbol: { type: string }
+              side: { $ref: '#/components/schemas/PositionSide' }
+              closed: { type: string }
+              remaining: { type: string }
+              error:
+                type: object
+                properties:
+                  code: { type: string }
+                  message: { type: string }
+    AdminMarket:
+      type: object
+      description: Full market row as stored (admin view).
+      properties:
+        id: { type: string, format: uuid }
+        symbol: { type: string }
+        baseAsset: { type: string }
+        hlKey: { type: string, description: 'Exact Hyperliquid coin key (HIP-3 prefixes are kept).' }
+        marketType: { $ref: '#/components/schemas/MarketType' }
+        szDecimals: { type: integer }
+        pricePrecision: { type: integer }
+        priceTick: { type: string }
+        sizeStep: { type: string }
+        minSize: { type: string }
+        minNotionalUsd: { type: string }
+        maxNotionalUsd: { type: string, nullable: true }
+        maxLeverage: { type: integer }
+        makerFeeRate: { type: string, nullable: true }
+        takerFeeRate: { type: string, nullable: true }
+        requireMarkConfirm: { type: boolean }
+        fundingSupported: { type: boolean }
+        isEnabled: { type: boolean }
+        isHalted: { type: boolean }
+        isCloseOnly: { type: boolean }
+        delistedAt: { type: string, format: date-time, nullable: true }
+        riskTierVersion: { type: string, description: Bumped on every limit / fee change and stored on every later fill. }
+    AdminMarketUpdate:
+      type: object
+      description: Send only what changes. Any key except `isEnabled` / `isHalted` starts a new `riskTierVersion`.
+      properties:
+        isEnabled: { type: boolean }
+        isHalted: { type: boolean }
+        isCloseOnly: { type: boolean }
+        maxLeverage: { type: integer, minimum: 1, maximum: 200 }
+        maxNotionalUsd: { type: number, exclusiveMinimum: true, minimum: 0, nullable: true, description: null removes the per-symbol cap. }
+        minNotionalUsd: { type: number, minimum: 0 }
+        makerFeeRate: { type: number, minimum: 0, maximum: 0.1, nullable: true, description: 'Rate of notional, 0.0004 = 0.04 %. null = use the fee group.' }
+        takerFeeRate: { type: number, minimum: 0, maximum: 0.1, nullable: true }
+        requireMarkConfirm: { type: boolean }
+        fundingSupported: { type: boolean }
+        marketType: { $ref: '#/components/schemas/MarketType' }
     Preset:
       type: object
       properties:
@@ -348,6 +690,7 @@ paths:
         Same response whether or not the email has an account (no account enumeration). Staff emails never get a code.
         For a new account, `portal` / `referralCode` / `platform` / `handle` are kept with the code and used on verify.
       x-rbac: public
+      security: []
       requestBody:
         required: true
         content:
@@ -371,6 +714,7 @@ paths:
       tags: [Auth (customer)]
       summary: Send a new code (60 s cooldown)
       x-rbac: public
+      security: []
       requestBody:
         required: true
         content:
@@ -390,6 +734,7 @@ paths:
       summary: Check the code and sign in (creates the account if new)
       description: Sets the `pp_at` / `pp_rt` cookies. 5 wrong tries end the code (`TOO_MANY_ATTEMPTS`); request a new one.
       x-rbac: public
+      security: []
       requestBody:
         required: true
         content:
@@ -415,6 +760,7 @@ paths:
       summary: Sign in / sign up with Google
       description: Send the Google Identity Services ID token. 503 `GOOGLE_DISABLED` when the server has no `GOOGLE_CLIENT_ID`.
       x-rbac: public
+      security: []
       requestBody:
         required: true
         content:
@@ -424,7 +770,7 @@ paths:
                 - type: object
                   required: [credential]
                   properties:
-                    credential: { type: string, description: Google ID token (JWT). }
+                    credential: { type: string, description: 'Google ID token (JWT).' }
                 - $ref: '#/components/schemas/SignupMeta'
       responses:
         '200': { description: Signed in, content: { application/json: { schema: { $ref: '#/components/schemas/SignInResult' } } } }
@@ -435,6 +781,7 @@ paths:
       tags: [Auth (customer)]
       summary: Is a username free? (case-insensitive)
       x-rbac: public
+      security: []
       parameters:
         - { name: username, in: query, required: true, schema: { type: string, pattern: '^[A-Za-z0-9_]{3,20}$' } }
       responses:
@@ -496,6 +843,7 @@ paths:
       tags: [Auth (customer)]
       summary: Sign out this browser
       x-rbac: public
+      security: []
       responses:
         '200': { description: Cookies cleared, content: { application/json: { schema: { $ref: '#/components/schemas/Ok' } } } }
   /api/v1/auth/logout-all:
@@ -543,6 +891,7 @@ paths:
         `otpauthUrl` to show as a QR code for Google Authenticator / 1Password etc.
         Any failure (wrong password, unknown, suspended, not staff) gives the same 401.
       x-rbac: public
+      security: []
       requestBody:
         required: true
         content:
@@ -578,6 +927,7 @@ paths:
       summary: Step 2 - authenticator code
       description: Sets the `pp_admin_at` / `pp_admin_rt` cookies. Turns 2FA on if this was the setup sign-in.
       x-rbac: public
+      security: []
       requestBody:
         required: true
         content:
@@ -594,7 +944,7 @@ paths:
           content:
             application/json:
               schema: { type: object, properties: { user: { $ref: '#/components/schemas/AdminUser' } } }
-        '401': { description: BAD_CODE, or the challenge expired., content: { application/json: { schema: { $ref: '#/components/schemas/Error' } } } }
+        '401': { description: 'BAD_CODE, or the challenge expired.', content: { application/json: { schema: { $ref: '#/components/schemas/Error' } } } }
         '429': { $ref: '#/components/responses/RateLimited' }
   /api/v1/admin/auth/me:
     get:
@@ -618,6 +968,7 @@ paths:
       tags: [Auth (admin)]
       summary: Sign out of the admin console
       x-rbac: public
+      security: []
       responses:
         '200': { description: Cookies cleared, content: { application/json: { schema: { type: object } } } }
 
@@ -851,13 +1202,327 @@ paths:
         '404': { $ref: '#/components/responses/NotFound' }
         '409': { description: SELF_ACTION., content: { application/json: { schema: { $ref: '#/components/schemas/Error' } } } }
 
-  # ===== Commented for now: non auth/RBAC routes. Uncomment when they are documented. =====
+
+  # ----------------------------------------------------------------- Markets
+  /api/v1/markets:
+    get:
+      tags: [Markets]
+      summary: All enabled markets with live price, limits and feed health
+      x-rbac: public
+      security: []
+      responses:
+        '200': { description: Markets, content: { application/json: { schema: { type: array, items: { $ref: '#/components/schemas/Market' } } } } }
+  /api/v1/markets/feed/status:
+    get:
+      tags: [Markets]
+      summary: Health of the live Hyperliquid feed
+      description: Connection state, active staleness limits and the age of every book / mark price.
+      x-rbac: public
+      security: []
+      responses:
+        '200': { description: Feed status, content: { application/json: { schema: { $ref: '#/components/schemas/FeedStatus' } } } }
+  /api/v1/markets/{symbol}:
+    get:
+      tags: [Markets]
+      summary: One market
+      x-rbac: public
+      security: []
+      parameters: [{ $ref: '#/components/parameters/SymbolParam' }]
+      responses:
+        '200': { description: Market, content: { application/json: { schema: { $ref: '#/components/schemas/Market' } } } }
+        '404': { $ref: '#/components/responses/NotFound' }
+  /api/v1/markets/{symbol}/price:
+    get:
+      tags: [Markets]
+      summary: Latest price tick (mid, bid, ask, mark, oracle, funding, freshness)
+      x-rbac: public
+      security: []
+      parameters: [{ $ref: '#/components/parameters/SymbolParam' }]
+      responses:
+        '200': { description: Price, content: { application/json: { schema: { $ref: '#/components/schemas/PriceTick' } } } }
+        '404': { $ref: '#/components/responses/NotFound' }
+        '422': { description: NO_PRICE - no price received yet., content: { application/json: { schema: { $ref: '#/components/schemas/Error' } } } }
+  /api/v1/markets/{symbol}/book:
+    get:
+      tags: [Markets]
+      summary: Order book snapshot (best levels first)
+      parameters:
+        - { $ref: '#/components/parameters/SymbolParam' }
+        - { name: depth, in: query, schema: { type: integer, minimum: 1, maximum: 20, default: 10 } }
+      x-rbac: public
+      security: []
+      responses:
+        '200': { description: Book, content: { application/json: { schema: { $ref: '#/components/schemas/OrderBook' } } } }
+        '404': { $ref: '#/components/responses/NotFound' }
+        '422': { description: NO_PRICE - no order book yet., content: { application/json: { schema: { $ref: '#/components/schemas/Error' } } } }
+
+  # ----------------------------------------------------------------- Trading
+  /api/v1/trading/accounts:
+    get:
+      tags: [Trading]
+      summary: My trading accounts
+      security: [{ customerCookie: [] }]
+      x-rbac: portal:TRADER
+      responses:
+        '200': { description: Accounts (with plan name), content: { application/json: { schema: { type: array, items: { type: object, additionalProperties: true } } } } }
+        '401': { $ref: '#/components/responses/Unauthorized' }
+        '403': { $ref: '#/components/responses/Forbidden' }
+  /api/v1/trading/accounts/{accountId}:
+    get:
+      tags: [Trading]
+      summary: Live account overview (balance, equity, margin, exposure, open positions)
+      security: [{ customerCookie: [] }]
+      x-rbac: portal:TRADER + ownership
+      parameters: [{ $ref: '#/components/parameters/AccountIdParam' }]
+      responses:
+        '200': { description: Overview, content: { application/json: { schema: { $ref: '#/components/schemas/AccountOverview' } } } }
+        '401': { $ref: '#/components/responses/Unauthorized' }
+        '403': { $ref: '#/components/responses/Forbidden' }
+        '404': { $ref: '#/components/responses/NotFound' }
+  /api/v1/trading/accounts/{accountId}/orders:
+    parameters: [{ $ref: '#/components/parameters/AccountIdParam' }]
+    post:
+      tags: [Trading]
+      summary: Place an order (market, limit, stop, take profit, stop loss)
+      description: |
+        Idempotent: send the `Idempotency-Key` header (max 64 chars) or `clientOrderId` in the body. A replay returns HTTP 200
+        with `duplicate: true`; a new order returns 201. Limited to 30 writes per second per user.
+        Fills are posted through the ledger (`REALIZED_PNL`, `FEE`) and risk rules are re-checked right after a trade.
+        Limits (editable in the `trading` setting): 50 open orders, 20 open position legs, 10 exit orders per position,
+        gross exposure <= 10x equity for new exposure.
+      security: [{ customerCookie: [] }]
+      x-rbac: portal:TRADER + ownership
+      parameters:
+        - { name: Idempotency-Key, in: header, required: false, schema: { type: string, maxLength: 64 } }
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema: { $ref: '#/components/schemas/PlaceOrderRequest' }
+            examples:
+              market: { value: { symbol: BTC, side: BUY, type: MARKET, size: '0.01', leverage: 5, maxSlippagePct: '1' } }
+              limit: { value: { symbol: ETH, side: SELL, type: LIMIT, size: '0.5', limitPrice: '3200.5', timeInForce: GTC, postOnly: true } }
+              stopLoss: { value: { symbol: BTC, side: SELL, type: STOP_LOSS, triggerPrice: '60000', closePosition: true } }
+      responses:
+        '200': { description: Duplicate request (already processed), content: { application/json: { schema: { $ref: '#/components/schemas/PlaceOrderResult' } } } }
+        '201': { description: Order accepted, content: { application/json: { schema: { $ref: '#/components/schemas/PlaceOrderResult' } } } }
+        '400': { $ref: '#/components/responses/BadRequest' }
+        '401': { $ref: '#/components/responses/Unauthorized' }
+        '403': { $ref: '#/components/responses/Forbidden' }
+        '404': { $ref: '#/components/responses/NotFound' }
+        '422': { $ref: '#/components/responses/Unprocessable' }
+        '429': { $ref: '#/components/responses/RateLimited' }
+    get:
+      tags: [Trading]
+      summary: List orders (newest first)
+      security: [{ customerCookie: [] }]
+      x-rbac: portal:TRADER + ownership
+      parameters:
+        - { name: active, in: query, description: 'true = only working orders (NEW / PARTIALLY_FILLED).', schema: { type: string, enum: ['true', 'false'] } }
+        - { name: limit, in: query, schema: { type: integer, minimum: 1, maximum: 200, default: 50 } }
+      responses:
+        '200': { description: Orders, content: { application/json: { schema: { type: array, items: { $ref: '#/components/schemas/Order' } } } } }
+        '401': { $ref: '#/components/responses/Unauthorized' }
+        '404': { $ref: '#/components/responses/NotFound' }
+    delete:
+      tags: [Trading]
+      summary: Cancel all working orders (entries and exits)
+      description: Optionally only one symbol and/or side. Does not close positions.
+      security: [{ customerCookie: [] }]
+      x-rbac: portal:TRADER + ownership
+      parameters:
+        - { name: symbol, in: query, schema: { type: string, maxLength: 20 } }
+        - { name: side, in: query, schema: { $ref: '#/components/schemas/OrderSide' } }
+      responses:
+        '200': { description: Cancelled, content: { application/json: { schema: { type: object, properties: { canceled: { type: integer } } } } } }
+        '401': { $ref: '#/components/responses/Unauthorized' }
+        '404': { $ref: '#/components/responses/NotFound' }
+        '429': { $ref: '#/components/responses/RateLimited' }
+  /api/v1/trading/accounts/{accountId}/orders/{orderId}:
+    parameters:
+      - { $ref: '#/components/parameters/AccountIdParam' }
+      - { $ref: '#/components/parameters/OrderIdParam' }
+    get:
+      tags: [Trading]
+      summary: One order with its fills
+      security: [{ customerCookie: [] }]
+      x-rbac: portal:TRADER + ownership
+      responses:
+        '200':
+          description: Order
+          content:
+            application/json:
+              schema:
+                allOf:
+                  - $ref: '#/components/schemas/Order'
+                  - type: object
+                    properties:
+                      fills: { type: array, items: { $ref: '#/components/schemas/Fill' } }
+        '401': { $ref: '#/components/responses/Unauthorized' }
+        '404': { $ref: '#/components/responses/NotFound' }
+    patch:
+      tags: [Trading]
+      summary: Modify price / trigger / size
+      description: The replacement is fully validated first, then the old order is cancelled in the same transaction (returns the new order).
+      security: [{ customerCookie: [] }]
+      x-rbac: portal:TRADER + ownership
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema: { $ref: '#/components/schemas/ModifyOrderRequest' }
+      responses:
+        '200': { description: Replacement order, content: { application/json: { schema: { $ref: '#/components/schemas/PlaceOrderResult' } } } }
+        '400': { $ref: '#/components/responses/BadRequest' }
+        '401': { $ref: '#/components/responses/Unauthorized' }
+        '404': { $ref: '#/components/responses/NotFound' }
+        '422': { $ref: '#/components/responses/Unprocessable' }
+        '429': { $ref: '#/components/responses/RateLimited' }
+    delete:
+      tags: [Trading]
+      summary: Cancel one order (idempotent)
+      description: Works even while prices are stale. Releases the reserved margin.
+      security: [{ customerCookie: [] }]
+      x-rbac: portal:TRADER + ownership
+      responses:
+        '200': { description: Cancelled order, content: { application/json: { schema: { $ref: '#/components/schemas/Order' } } } }
+        '401': { $ref: '#/components/responses/Unauthorized' }
+        '404': { $ref: '#/components/responses/NotFound' }
+        '422': { $ref: '#/components/responses/Unprocessable' }
+        '429': { $ref: '#/components/responses/RateLimited' }
+  /api/v1/trading/accounts/{accountId}/positions/{symbol}/close:
+    post:
+      tags: [Trading]
+      summary: Close a position (whole, or `size` for a partial close)
+      description: |
+        Reduce-only market order at the live book. A thin book gives a partial fill and the rest stays open.
+        In hedge mode with both legs open, `positionSide` is required (`POSITION_SIDE_REQUIRED`).
+      security: [{ customerCookie: [] }]
+      x-rbac: portal:TRADER + ownership
+      parameters:
+        - { $ref: '#/components/parameters/AccountIdParam' }
+        - { $ref: '#/components/parameters/SymbolParam' }
+      requestBody:
+        required: false
+        content:
+          application/json:
+            schema: { $ref: '#/components/schemas/ClosePositionRequest' }
+      responses:
+        '200': { description: Close result, content: { application/json: { schema: { $ref: '#/components/schemas/PlaceOrderResult' } } } }
+        '400': { $ref: '#/components/responses/BadRequest' }
+        '401': { $ref: '#/components/responses/Unauthorized' }
+        '404': { description: No open position in this market., content: { application/json: { schema: { $ref: '#/components/schemas/Error' } } } }
+        '422': { $ref: '#/components/responses/Unprocessable' }
+        '429': { $ref: '#/components/responses/RateLimited' }
+  /api/v1/trading/accounts/{accountId}/positions/close-all:
+    post:
+      tags: [Trading]
+      summary: Close all positions (or only longs / only shorts)
+      description: Each market is closed in its own transaction. Per-market errors are returned in `results[].error`, nothing is reported closed unless it was.
+      security: [{ customerCookie: [] }]
+      x-rbac: portal:TRADER + ownership
+      parameters: [{ $ref: '#/components/parameters/AccountIdParam' }]
+      requestBody:
+        required: false
+        content:
+          application/json:
+            schema: { type: object, properties: { side: { $ref: '#/components/schemas/PositionSide' } } }
+      responses:
+        '200': { description: Per-market results, content: { application/json: { schema: { $ref: '#/components/schemas/CloseAllResult' } } } }
+        '401': { $ref: '#/components/responses/Unauthorized' }
+        '404': { $ref: '#/components/responses/NotFound' }
+        '429': { $ref: '#/components/responses/RateLimited' }
+  /api/v1/trading/accounts/{accountId}/position-mode:
+    put:
+      tags: [Trading]
+      summary: Switch ONE_WAY / HEDGE
+      description: Only while the account has no open positions and no working orders (`POSITION_MODE_LOCKED` otherwise).
+      security: [{ customerCookie: [] }]
+      x-rbac: portal:TRADER + ownership
+      parameters: [{ $ref: '#/components/parameters/AccountIdParam' }]
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema: { type: object, required: [mode], properties: { mode: { $ref: '#/components/schemas/PositionMode' } } }
+      responses:
+        '200': { description: Mode set, content: { application/json: { schema: { type: object, properties: { positionMode: { $ref: '#/components/schemas/PositionMode' } } } } } }
+        '400': { $ref: '#/components/responses/BadRequest' }
+        '401': { $ref: '#/components/responses/Unauthorized' }
+        '404': { $ref: '#/components/responses/NotFound' }
+        '422': { $ref: '#/components/responses/Unprocessable' }
+  /api/v1/trading/accounts/{accountId}/fills:
+    get:
+      tags: [Trading]
+      summary: Fill history (latest 50)
+      security: [{ customerCookie: [] }]
+      x-rbac: portal:TRADER + ownership
+      parameters: [{ $ref: '#/components/parameters/AccountIdParam' }]
+      responses:
+        '200': { description: Fills, content: { application/json: { schema: { type: array, items: { $ref: '#/components/schemas/Fill' } } } } }
+        '401': { $ref: '#/components/responses/Unauthorized' }
+        '404': { $ref: '#/components/responses/NotFound' }
+  /api/v1/trading/accounts/{accountId}/ledger:
+    get:
+      tags: [Trading]
+      summary: Ledger (realized PnL, fees, funding, adjustments; latest 100)
+      security: [{ customerCookie: [] }]
+      x-rbac: portal:TRADER + ownership
+      parameters: [{ $ref: '#/components/parameters/AccountIdParam' }]
+      responses:
+        '200': { description: Ledger entries, content: { application/json: { schema: { type: array, items: { $ref: '#/components/schemas/LedgerEntry' } } } } }
+        '401': { $ref: '#/components/responses/Unauthorized' }
+        '404': { $ref: '#/components/responses/NotFound' }
+
+  # ------------------------------------------------------------ Admin markets
+  /api/v1/admin/markets:
+    get:
+      tags: [Admin markets]
+      summary: Market registry (all markets, including disabled)
+      security: [{ adminCookie: [] }]
+      x-rbac: section:markets:view
+      responses:
+        '200': { description: Markets, content: { application/json: { schema: { type: array, items: { $ref: '#/components/schemas/AdminMarket' } } } } }
+        '401': { $ref: '#/components/responses/Unauthorized' }
+        '403': { $ref: '#/components/responses/Forbidden' }
+  /api/v1/admin/markets/sync:
+    post:
+      tags: [Admin markets]
+      summary: Sync the registry from Hyperliquid
+      description: |
+        Only symbols in `LAUNCH_SYMBOLS` are stored. Runs at startup too. New symbols get the reviewed catalog limits; a symbol without a
+        reviewed row is created **disabled**. A delisted contract becomes **close-only**. Admin edits are never overwritten; a lower
+        Hyperliquid leverage limit always wins. Writes an audit log entry.
+      security: [{ adminCookie: [] }]
+      x-rbac: section:markets:manage + right:market.sync
+      responses:
+        '200': { description: Number of markets synced, content: { application/json: { schema: { type: object, properties: { synced: { type: integer } } } } } }
+        '401': { $ref: '#/components/responses/Unauthorized' }
+        '403': { $ref: '#/components/responses/Forbidden' }
+  /api/v1/admin/markets/{id}:
+    patch:
+      tags: [Admin markets]
+      summary: Edit a market (enable, halt, close-only, limits, fees)
+      description: Any change to limits or fees starts a new `riskTierVersion`, stored on every later fill. The live feed starts/stops tracking the symbol with `isEnabled`. Writes an audit log entry.
+      security: [{ adminCookie: [] }]
+      x-rbac: section:markets:manage
+      parameters: [{ $ref: '#/components/parameters/IdParam' }]
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema: { $ref: '#/components/schemas/AdminMarketUpdate' }
+            example: { isCloseOnly: true, maxNotionalUsd: 500000, takerFeeRate: 0.0004 }
+      responses:
+        '200': { description: Updated market, content: { application/json: { schema: { $ref: '#/components/schemas/AdminMarket' } } } }
+        '400': { $ref: '#/components/responses/BadRequest' }
+        '401': { $ref: '#/components/responses/Unauthorized' }
+        '403': { $ref: '#/components/responses/Forbidden' }
+        '404': { $ref: '#/components/responses/NotFound' }
+
+  # ===== Commented for now: other non auth/RBAC routes (payments, payouts, affiliates, admin features). Uncomment when they are documented. =====
   # --------------------------------------------------------- Route matrix
   # Existing routes, listed so every guard is documented in one place.
-  # /api/v1/trading/accounts:
-  #   get: { tags: [Route matrix], summary: My trading accounts, security: [{ customerCookie: [] }], x-rbac: portal:TRADER, responses: { '200': { description: OK }, '403': { $ref: '#/components/responses/Forbidden' } } }
-  # /api/v1/trading/accounts/{accountId}/orders:
-  #   post: { tags: [Route matrix], summary: Place an order (own account only), security: [{ customerCookie: [] }], x-rbac: portal:TRADER + ownership, parameters: [{ name: accountId, in: path, required: true, schema: { type: string, format: uuid } }], responses: { '201': { description: Created }, '403': { $ref: '#/components/responses/Forbidden' } } }
   # /api/v1/payments/checkout:
   #   post: { tags: [Route matrix], summary: Buy a challenge, security: [{ customerCookie: [] }], x-rbac: portal:TRADER, responses: { '200': { description: OK }, '403': { $ref: '#/components/responses/Forbidden' } } }
   # /api/v1/payments/purchases:
@@ -878,12 +1543,6 @@ paths:
   #   post: { tags: [Route matrix], summary: Create plan, security: [{ adminCookie: [] }], x-rbac: section:plans:manage, responses: { '201': { description: Created } } }
   # /api/v1/admin/plans/{id}:
   #   patch: { tags: [Route matrix], summary: Edit plan, security: [{ adminCookie: [] }], x-rbac: section:plans:manage, parameters: [{ $ref: '#/components/parameters/IdParam' }], responses: { '200': { description: OK } } }
-  # /api/v1/admin/markets:
-  #   get: { tags: [Route matrix], summary: Markets, security: [{ adminCookie: [] }], x-rbac: section:markets:view, responses: { '200': { description: OK } } }
-  # /api/v1/admin/markets/sync:
-  #   post: { tags: [Route matrix], summary: Sync from Hyperliquid, security: [{ adminCookie: [] }], x-rbac: section:markets:manage + right:market.sync, responses: { '200': { description: OK } } }
-  # /api/v1/admin/markets/{id}:
-  #   patch: { tags: [Route matrix], summary: Edit market, security: [{ adminCookie: [] }], x-rbac: section:markets:manage, parameters: [{ $ref: '#/components/parameters/IdParam' }], responses: { '200': { description: OK } } }
   # /api/v1/admin/accounts:
   #   get: { tags: [Route matrix], summary: Trading accounts, security: [{ adminCookie: [] }], x-rbac: section:accounts:view, responses: { '200': { description: OK } } }
   # /api/v1/admin/accounts/{id}/lock:
