@@ -1,5 +1,6 @@
 import { fetchCandles, fetchFundingHistory, fetchL2Book, fetchMetaAndAssetCtxs, fetchPerpMeta } from '../src/modules/markets/hyperliquid.client';
 import { priceFeed } from '../src/modules/markets/price-feed';
+import { divergenceLimitPct, isDivergenceExceeded, maxNotionalByLiquidity } from '../src/modules/trading/engine/market-policy';
 
 const SYMBOLS = ['BTC', 'ETH'];
 const LISTEN_MS = 20_000;
@@ -83,6 +84,27 @@ async function main() {
     const c = priceFeed.getLatestCandle('BTC', '1m')!;
     return `${candleUpdates} updates, latest close=${c.close} volume=${c.volume}`;
   });
+  // Inputs of the trading engine rules (spec): freshness status, mark / book agreement, liquidity guard depth
+  for (const s of SYMBOLS) {
+    await check(`engine ${s}: feed status is LIVE (not DELAYED / PAUSED)`, async () => {
+      const st = priceFeed.feedStatus(s);
+      if (st !== 'LIVE') throw new Error(`status=${st} markAge=${priceFeed.markAgeMs(s)}ms`);
+      return `status=${st} markAge=${priceFeed.markAgeMs(s)}ms`;
+    });
+    await check(`engine ${s}: book mid and mark agree (below the pause limit)`, async () => {
+      const pct = priceFeed.divergencePct(s);
+      if (!pct) throw new Error('divergence cannot be computed (book or mark missing)');
+      const limit = divergenceLimitPct(s);
+      if (isDivergenceExceeded(s, pct)) throw new Error(`divergence ${pct.toFixed(4)}% is above ${limit}%`);
+      return `divergence=${pct.toFixed(4)}% limit=${limit}%`;
+    });
+    await check(`engine ${s}: liquidity guard has depth samples`, async () => {
+      const buy = priceFeed.robustDepthUsd(s, 'BUY');
+      const sell = priceFeed.robustDepthUsd(s, 'SELL');
+      if (!buy || !sell) throw new Error('no depth samples yet');
+      return `askDepth1pct=${buy.toFixed(0)} USD bidDepth1pct=${sell.toFixed(0)} USD -> max single entry ${maxNotionalByLiquidity(buy).toFixed(0)} / ${maxNotionalByLiquidity(sell).toFixed(0)} USD`;
+    });
+  }
   console.log(`connected=${status.connected} reconnects=${status.reconnects} droppedOutOfOrder=${status.droppedOutOfOrder}`);
 
   priceFeed.stop();

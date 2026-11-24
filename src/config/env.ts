@@ -54,6 +54,10 @@ const schema = z.object({
   STALE_PRICE_MS: z.coerce.number().int().min(500).default(5000),
   STALE_BOOK_MS: z.coerce.number().int().min(500).optional(),
   STALE_MARK_MS: z.coerce.number().int().min(500).optional(),
+  // Spec: a mark price older than this shows the "Delayed" status (trading is still allowed until STALE_MARK_MS)
+  DELAYED_MARK_MS: z.coerce.number().int().min(250).default(2000),
+  // Spec: periodic funding cash flow is disabled in v1 (the reference rate is shown but never charged)
+  FUNDING_ENABLED: z.enum(['true', 'false']).default('false'),
   // Timeout for every Hyperliquid REST call
   HYPERLIQUID_TIMEOUT_MS: z.coerce.number().int().min(1000).default(8000),
   // Watchdog: reconnect when the Hyperliquid socket is silent for this long
@@ -89,7 +93,10 @@ export const corsOrigins = env.CORS_ORIGINS.split(',').map((s) => s.trim());
 // Freshness limits (milliseconds). The mark price moves more slowly than the book on quiet
 // markets, so by default it is allowed to be a little older than the book.
 export const staleBookMs = env.STALE_BOOK_MS ?? env.STALE_PRICE_MS;
-export const staleMarkMs = env.STALE_MARK_MS ?? Math.max(env.STALE_PRICE_MS, 10_000);
+// Spec: a mark price that is 5 seconds old hard-pauses new price dependent operations.
+export const staleMarkMs = env.STALE_MARK_MS ?? env.STALE_PRICE_MS;
+export const delayedMarkMs = Math.min(env.DELAYED_MARK_MS, staleMarkMs);
+export const fundingEnabled = env.FUNDING_ENABLED === 'true';
 
 
 ///Test

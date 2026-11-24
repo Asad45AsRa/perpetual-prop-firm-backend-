@@ -2,7 +2,15 @@ import Decimal from 'decimal.js';
 import type { BookSide } from './orderbook';
 
 // =====================================================================
-// Pure trigger and fill-eligibility rules.
+// Pure trigger, marketability and fill price rules (spec sections 4 and 6).
+//
+//  * The server mark price is the only authoritative price. The order book is used to decide
+//    marketability and liquidity, never to price a fill.
+//  * Market order            : fills at the fresh mark, zero slippage, taker.
+//  * Marketable limit        : fills at the fresh mark, never worse than the limit, taker.
+//  * Resting limit           : fills at the exact saved limit price, maker, when a LATER fresh mark crosses it.
+//  * Stop / TP / SL          : triggered by the mark only. Continuous crossing fills at the saved trigger price,
+//                              the first fresh mark after an outage (gap) fills at that mark.
 // =====================================================================
 
 export type TriggerOrderType = 'STOP_MARKET' | 'TAKE_PROFIT' | 'STOP_LOSS';
@@ -23,25 +31,34 @@ export function triggerDirection(type: TriggerOrderType, side: BookSide): 'UP' |
   return side === 'SELL' ? 'DOWN' : 'UP';
 }
 
-// A trigger fires when EITHER the mark price OR the executable side of the book touches the level.
-// The executable side is the one the order would trade against: asks for a BUY, bids for a SELL.
-export function isTriggered(type: TriggerOrderType, side: BookSide, trigger: Decimal, quote: Quote): boolean {
-  const direction = triggerDirection(type, side);
-  const executable = side === 'BUY' ? quote.ask : quote.bid;
-  const test = (px: Decimal | null) => (px ? (direction === 'UP' ? px.gte(trigger) : px.lte(trigger)) : false);
-  return test(quote.mark) || test(executable);
-}
-
-// A limit order is marketable when it crosses the opposite best price at placement.
-export function isMarketable(side: BookSide, limit: Decimal, quote: Pick<Quote, 'bid' | 'ask'>): boolean {
-  return side === 'BUY' ? !!quote.ask && quote.ask.lte(limit) : !!quote.bid && quote.bid.gte(limit);
-}
-
-// A resting limit order fills when the opposite best price touches its limit.
-// Markets flagged "requireMarkConfirm" also need the mark price on the right side of the limit.
-export function restingLimitCrossed(side: BookSide, limit: Decimal, quote: Quote, requireMarkConfirm: boolean): boolean {
-  if (!isMarketable(side, limit, quote)) return false;
-  if (!requireMarkConfirm) return true;
+// A trigger fires when the MARK price touches or crosses the level (the book is not used).
+export function isTriggered(type: TriggerOrderType, side: BookSide, trigger: Decimal, quote: Pick<Quote, 'mark'>): boolean {
   if (!quote.mark) return false;
-  return side === 'BUY' ? quote.mark.lte(limit) : quote.mark.gte(limit);
+  return triggerDirection(type, side) === 'UP' ? quote.mark.gte(trigger) : quote.mark.lte(trigger);
+}
+
+// A limit order is marketable at acceptance when it immediately crosses the opposite best price OR the mark.
+// A marketable order is a taker. A post-only order that is marketable is rejected.
+export function isMarketable(side: BookSide, limit: Decimal, quote: Quote): boolean {
+  const crossesBook = side === 'BUY' ? !!quote.ask && quote.ask.lte(limit) : !!quote.bid && quote.bid.gte(limit);
+  const crossesMark = !!quote.mark && (side === 'BUY' ? quote.mark.lte(limit) : quote.mark.gte(limit));
+  return crossesBook || crossesMark;
+}
+
+// Fill price of a marketable limit order: the fresh mark, but never worse than the limit.
+export function marketableLimitFillPrice(side: BookSide, limit: Decimal, mark: Decimal): Decimal {
+  return side === 'BUY' ? Decimal.min(mark, limit) : Decimal.max(mark, limit);
+}
+
+// A resting limit order fills when a fresh mark crosses its saved limit (the fill price is the limit itself).
+export function restingLimitCrossed(side: BookSide, limit: Decimal, mark: Decimal | null): boolean {
+  if (!mark) return false;
+  return side === 'BUY' ? mark.lte(limit) : mark.gte(limit);
+}
+
+// Execution price of a triggered stop / TP / SL.
+//   ordinary continuous crossing  -> the saved trigger price
+//   first fresh mark after an outage (afterGap) -> that mark, no invented intermediate price
+export function triggerFillPrice(trigger: Decimal, mark: Decimal, afterGap: boolean): Decimal {
+  return afterGap ? mark : trigger;
 }

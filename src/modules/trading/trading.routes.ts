@@ -3,6 +3,7 @@ import { z } from 'zod';
 import { requirePortal } from '../../middleware/auth';
 import { Decimal } from '../../utils/decimal';
 import { parse } from '../../utils/validate';
+import { EXPIRY_CHOICES, expiryToDate } from './engine/market-policy';
 import * as service from './trading.service';
 
 // Decimals travel as strings so no precision is lost in JSON
@@ -21,13 +22,31 @@ const orderSchema = z.object({
   leverage: z.number().int().min(1).max(200).default(1),
   reduceOnly: z.boolean().default(false),
   postOnly: z.boolean().default(false),
-  timeInForce: z.enum(['GTC', 'IOC']).default('GTC'),
+  // Resting limit orders: good till cancelled, or cancelled by the server after 5 minutes / 1 hour / 24 hours / 30 days
+  expiry: z.enum(EXPIRY_CHOICES).default('GTC'),
   // Hedge mode: which leg the order works on
   positionSide: z.enum(['LONG', 'SHORT']).optional(),
-  // Opening market orders: reject when slippage is above this percent (default 3)
-  maxSlippagePct: positive.optional(),
   clientOrderId: z.string().min(1).max(64).optional(),
 });
+
+// Order ticket preview: send ONE of size (coins), notionalUsd (value) or marginUsd (margin x leverage)
+const previewSchema = z
+  .object({
+    symbol: z.string().min(1).max(20),
+    side: z.enum(['BUY', 'SELL']),
+    type: z.enum(['MARKET', 'LIMIT', 'STOP_MARKET']).default('MARKET'),
+    size: positive.optional(),
+    notionalUsd: positive.optional(),
+    marginUsd: positive.optional(),
+    leverage: z.number().int().min(1).max(200).default(1),
+    limitPrice: positive.optional(),
+    triggerPrice: positive.optional(),
+    reduceOnly: z.boolean().default(false),
+    postOnly: z.boolean().default(false),
+  })
+  .refine((v) => [v.size, v.notionalUsd, v.marginUsd].filter(Boolean).length === 1, 'Send exactly one of size, notionalUsd, marginUsd')
+  .refine((v) => v.type !== 'LIMIT' || !!v.limitPrice, 'A limit order needs a limit price')
+  .refine((v) => v.type !== 'STOP_MARKET' || !!v.triggerPrice, 'A stop order needs a trigger price');
 
 const modifySchema = z
   .object({ size: positive.optional(), limitPrice: positive.optional(), triggerPrice: positive.optional() })
@@ -79,12 +98,33 @@ export async function tradingRoutes(app: FastifyInstance) {
       leverage: body.leverage,
       reduceOnly: body.reduceOnly,
       postOnly: body.postOnly,
-      timeInForce: body.timeInForce,
+      // The server clock sets the expiry time (GTC = never)
+      expiresAt: body.type === 'LIMIT' ? expiryToDate(body.expiry) : null,
       positionSide: body.positionSide ?? null,
-      maxSlippagePct: body.maxSlippagePct ? new Decimal(body.maxSlippagePct) : null,
       clientOrderId,
     });
     return reply.status(result.duplicate ? 200 : 201).send(result);
+  });
+
+  // Preview of the order ticket (size, notional, margin, fee, maker / taker, maximum valid size and the binding rule).
+  // Read only: nothing is reserved, nothing is written.
+  app.post('/accounts/:accountId/orders/preview', async (req) => {
+    const { accountId } = parse(accountParams, req.params);
+    const body = parse(previewSchema, req.body);
+    return service.previewTrade(req.user!.id, {
+      accountId,
+      symbol: body.symbol,
+      side: body.side,
+      type: body.type,
+      size: body.size ? new Decimal(body.size) : null,
+      notionalUsd: body.notionalUsd ? new Decimal(body.notionalUsd) : null,
+      marginUsd: body.marginUsd ? new Decimal(body.marginUsd) : null,
+      leverage: body.leverage,
+      limitPrice: body.limitPrice ? new Decimal(body.limitPrice) : null,
+      triggerPrice: body.triggerPrice ? new Decimal(body.triggerPrice) : null,
+      reduceOnly: body.reduceOnly,
+      postOnly: body.postOnly,
+    });
   });
 
   app.get('/accounts/:accountId/orders', async (req) => {
@@ -141,7 +181,7 @@ export async function tradingRoutes(app: FastifyInstance) {
     return service.closeAllPositions(req.user!.id, accountId, body.side);
   });
 
-  // One-way / hedge. Only while the account has no positions and no working orders.
+  // Spec v1: one net position per symbol. ONE_WAY is accepted, HEDGE is refused (HEDGE_NOT_AVAILABLE).
   app.put('/accounts/:accountId/position-mode', async (req) => {
     const { accountId } = parse(accountParams, req.params);
     const body = parse(z.object({ mode: z.enum(['ONE_WAY', 'HEDGE']) }), req.body);

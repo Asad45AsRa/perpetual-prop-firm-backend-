@@ -8,6 +8,7 @@ import { priceFeed } from '../markets/price-feed';
 import { computeAccountSnapshot } from '../trading/account-snapshot';
 import { executeMarketOrder } from '../trading/trading.service';
 import { cancelActiveOrders } from '../trading/order-engine';
+import { tradingEvents } from '../trading/trading-events';
 import { isLiquidated } from '../trading/engine/calculations';
 import { evaluateRisk } from './risk-rules';
 
@@ -61,6 +62,24 @@ export async function lockAccount(
     },
     { timeout: 15_000 },
   );
+  tradingEvents.accountChanged(accountId, 'risk');
+}
+
+// Margin-only forced close (spec section 8): the account is healthy (no daily / static breach) but its equity fell to the
+// total maintenance threshold. Pending orders are cancelled and every position is closed at the server mark, with NO extra
+// penalty (only the ordinary taker exit fee). The account stays ACTIVE.
+async function forceCloseForMargin(accountId: string, details: Prisma.InputJsonValue) {
+  await prisma.$transaction(
+    async (tx) => {
+      await tx.$queryRaw`SELECT id FROM "TradingAccount" WHERE id = ${accountId}::uuid FOR UPDATE`;
+      await cancelActiveOrders(tx, accountId, 'RISK_MAINTENANCE_MARGIN');
+      await closeAllPositions(tx, accountId);
+      await recordEvent(tx, accountId, 'LIQUIDATION', details);
+      await audit({ action: 'risk.maintenance_margin_close', entity: 'TradingAccount', entityId: accountId, metadata: details }, tx);
+    },
+    { timeout: 15_000 },
+  );
+  tradingEvents.accountChanged(accountId, 'risk');
 }
 
 // Challenge passed: close positions, mark PASSED and create the funded account.
@@ -104,6 +123,7 @@ async function passChallenge(accountId: string, details: Prisma.InputJsonValue) 
     },
     { timeout: 15_000 },
   );
+  tradingEvents.accountChanged(accountId, 'risk');
 }
 
 // Checks one account against all rules and enforces the result.
@@ -158,6 +178,17 @@ export async function evaluateAccount(accountId: string) {
     return;
   }
 
+  // 4) Maintenance margin: only for a healthy account and only on fresh marks (never on stale prices)
+  if (
+    snapshot.positions.length > 0 &&
+    snapshot.equity.lte(snapshot.maintenanceMargin) &&
+    snapshot.positions.every((p) => priceFeed.isMarkFresh(p.symbol))
+  ) {
+    await forceCloseForMargin(accountId, { ...details, maintenanceMargin: snapshot.maintenanceMargin.toString(), reason: 'MAINTENANCE_MARGIN' });
+    logger.warn({ accountId }, 'Positions force-closed at the maintenance margin threshold');
+    return;
+  }
+  // 5) Profit target
   if (result.targetReached && (await hasMinTradingDays(accountId, account.plan.minTradingDays))) {
     await passChallenge(accountId, { ...details, profit: result.profit.toString() });
     logger.info({ accountId }, 'Challenge passed');
@@ -203,4 +234,3 @@ export async function runDailyReset() {
   }
   logger.info({ accounts: accounts.length }, 'Daily reset completed');
 }
-

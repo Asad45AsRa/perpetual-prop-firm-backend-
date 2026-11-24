@@ -1,6 +1,6 @@
 import { EventEmitter } from 'events';
 import WebSocket from 'ws';
-import { env, staleBookMs, staleMarkMs } from '../../config/env';
+import { delayedMarkMs, env, staleBookMs, staleMarkMs } from '../../config/env';
 import { logger } from '../../config/logger';
 import { Decimal } from '../../utils/decimal';
 import type { BookLevel, BookSnapshot } from '../trading/engine/orderbook';
@@ -101,6 +101,26 @@ const CTX_POLL_INTERVAL_MS = 5_000;
 const CTX_POLL_WHEN_OLDER_THAN_MS = 4_000;
 // Public trades kept in memory per symbol (newest last)
 const TRADE_BUFFER_SIZE = 200;
+// Liquidity guard input (spec): visible depth within 1 percent of the mark, sampled over a 30 second window
+const DEPTH_BAND_PCT = new Decimal('0.01');
+const DEPTH_WINDOW_MS = 30_000;
+const DEPTH_SAMPLE_MIN_GAP_MS = 250;
+
+// Delayed = mark older than DELAYED_MARK_MS, Paused = book or mark older than the hard limit
+export type FeedStatus = 'LIVE' | 'DELAYED' | 'PAUSED';
+
+interface DepthSample {
+  at: number;
+  // Notional (USD) of the levels within 1 percent of the mark: asks are what a BUY consumes, bids what a SELL consumes
+  asks: Decimal;
+  bids: Decimal;
+}
+
+const median = (values: Decimal[]): Decimal => {
+  const sorted = [...values].sort((a, b) => a.cmp(b));
+  const mid = Math.floor(sorted.length / 2);
+  return sorted.length % 2 === 1 ? sorted[mid] : sorted[mid - 1].plus(sorted[mid]).div(2);
+};
 
 // Optional numeric field of a Hyperliquid context: missing, empty or invalid values become null.
 function optionalDecimal(value: string | null | undefined): Decimal | null {
@@ -133,6 +153,7 @@ function parseLevels(raw: HlLevel[] | undefined, side: 'BID' | 'ASK'): BookLevel
 class PriceFeed extends EventEmitter {
   private ws: WebSocket | null = null;
   private books = new Map<string, BookSnapshot>();
+  private depthSamples = new Map<string, DepthSample[]>();
   private marks = new Map<string, MarkInfo>();
   // symbol -> Hyperliquid coin key
   private tracked = new Map<string, string>();
@@ -201,6 +222,7 @@ class PriceFeed extends EventEmitter {
     this.books.delete(symbol);
     this.marks.delete(symbol);
     this.trades.delete(symbol);
+    this.depthSamples.delete(symbol);
   }
 
   // Live candles on demand. Every call must be paired with one unsubscribeCandle call.
@@ -270,6 +292,36 @@ class PriceFeed extends EventEmitter {
     return this.isBookFresh(symbol, now) && this.isMarkFresh(symbol, now);
   }
 
+  // Age of the newest mark price in milliseconds (null = no mark received yet).
+  markAgeMs(symbol: string, now = Date.now()): number | null {
+    const mark = this.marks.get(symbol);
+    return mark ? now - mark.receivedAt : null;
+  }
+
+  // LIVE: healthy. DELAYED: mark older than DELAYED_MARK_MS (warning only). PAUSED: book or mark too old, trading is blocked.
+  feedStatus(symbol: string, now = Date.now()): FeedStatus {
+    if (!this.isFresh(symbol, now)) return 'PAUSED';
+    const age = this.markAgeMs(symbol, now);
+    return age != null && age >= delayedMarkMs ? 'DELAYED' : 'LIVE';
+  }
+
+  // Distance between the book mid and the mark price in percent (null when either is missing).
+  divergencePct(symbol: string): Decimal | null {
+    const book = this.books.get(symbol);
+    const mark = this.marks.get(symbol);
+    if (!book || !mark || mark.mark.lte(0)) return null;
+    const mid = midPrice(book);
+    return mid ? mid.minus(mark.mark).abs().div(mark.mark).mul(100) : null;
+  }
+
+  // Robust (median) visible depth of the relevant side over the last 30 seconds, in USD notional.
+  // A BUY consumes asks, a SELL consumes bids. Returns null until at least one sample exists.
+  robustDepthUsd(symbol: string, side: 'BUY' | 'SELL', now = Date.now()): Decimal | null {
+    const samples = (this.depthSamples.get(symbol) ?? []).filter((s) => now - s.at <= DEPTH_WINDOW_MS);
+    if (samples.length === 0) return null;
+    return median(samples.map((s) => (side === 'BUY' ? s.asks : s.bids)));
+  }
+
   getPrice(symbol: string): PriceTick | undefined {
     const book = this.books.get(symbol);
     if (!book) return undefined;
@@ -304,7 +356,7 @@ class PriceFeed extends EventEmitter {
       reconnects: this.reconnects,
       droppedOutOfOrder: this.droppedOutOfOrder,
       candleSubscriptions: [...this.candleSubs.values()].map((c) => ({ symbol: c.symbol, interval: c.interval, consumers: c.refs })),
-      limits: { staleBookMs, staleMarkMs },
+      limits: { staleBookMs, staleMarkMs, delayedMarkMs },
       symbols: [...this.tracked.keys()].map((symbol) => {
         const book = this.books.get(symbol);
         const mark = this.marks.get(symbol);
@@ -314,6 +366,8 @@ class PriceFeed extends EventEmitter {
           markAgeMs: mark ? now - mark.receivedAt : null,
           bookFresh: this.isBookFresh(symbol, now),
           markFresh: this.isMarkFresh(symbol, now),
+          feedStatus: this.feedStatus(symbol, now),
+          divergencePct: this.divergencePct(symbol)?.toFixed(4) ?? null,
           bufferedTrades: this.trades.get(symbol)?.length ?? 0,
         };
       }),
@@ -343,9 +397,29 @@ class PriceFeed extends EventEmitter {
 
     const book: BookSnapshot = { symbol, bids, asks, receivedAt: now, exchangeTime, seq: ++this.seq };
     this.books.set(symbol, book);
+    this.sampleDepth(symbol, book, now);
     this.emit('book', book);
     this.emitPrice(symbol);
     return true;
+  }
+
+  // Keeps a rolling 30 second history of the visible depth near the mark (input of the liquidity guard).
+  private sampleDepth(symbol: string, book: BookSnapshot, now: number) {
+    const reference = this.marks.get(symbol)?.mark ?? midPrice(book);
+    if (!reference) return;
+    const list = this.depthSamples.get(symbol) ?? [];
+    const last = list[list.length - 1];
+    if (last && now - last.at < DEPTH_SAMPLE_MIN_GAP_MS) return;
+
+    const low = reference.mul(new Decimal(1).minus(DEPTH_BAND_PCT));
+    const high = reference.mul(new Decimal(1).plus(DEPTH_BAND_PCT));
+    const notionalWithin = (levels: BookSnapshot['bids'], test: (p: Decimal) => boolean) =>
+      levels.filter((l) => test(l.price)).reduce((sum, l) => sum.plus(l.price.mul(l.size)), new Decimal(0));
+
+    list.push({ at: now, bids: notionalWithin(book.bids, (p) => p.gte(low)), asks: notionalWithin(book.asks, (p) => p.lte(high)) });
+    const cutoff = now - DEPTH_WINDOW_MS;
+    while (list.length > 0 && list[0].at < cutoff) list.shift();
+    this.depthSamples.set(symbol, list);
   }
 
   ingestMark(

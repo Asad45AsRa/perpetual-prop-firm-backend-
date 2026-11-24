@@ -3,8 +3,10 @@ import { prisma, type Tx } from '../../config/prisma';
 import { ApiError } from '../../utils/api-error';
 import { Decimal, toD } from '../../utils/decimal';
 import { evaluateAccount } from '../risk/risk.service';
-import { computeAccountSnapshot } from './account-snapshot';
+import { computeAccountSnapshot, presentAccountOverview } from './account-snapshot';
 import { ACTIVE_STATUSES, cancelOrderRow, lockAccount, submitOrder, type OrderParams, type PriceInput } from './order-engine';
+import { previewOrder, type PreviewInput } from './order-preview';
+import { tradingEvents } from './trading-events';
 
 // =====================================================================
 // Public trading API used by the routes (and by the risk engine).
@@ -42,6 +44,8 @@ async function assertOwner(userId: string, accountId: string) {
 async function runOrder(userId: string, params: OrderParams) {
   await assertOwner(userId, params.accountId);
   const result = await prisma.$transaction((tx) => submitOrder(tx, params), { timeout: 10_000, maxWait: 5_000 });
+  // Tell the terminal sessions of this account that orders / fills / positions changed (after the commit)
+  if (!result.duplicate) tradingEvents.accountChanged(params.accountId, result.fills.length > 0 ? 'fill' : 'order');
   // Re-check risk rules right after a trade
   if (!result.duplicate && result.fills.length > 0) await evaluateAccount(params.accountId).catch(() => undefined);
   return { ...result, fill: result.fills[0] ?? null };
@@ -81,6 +85,8 @@ export async function modifyOrder(
     reduceOnly: old.reduceOnly,
     postOnly: old.postOnly,
     timeInForce: old.timeInForce,
+    // The replacement keeps the expiry of the order it replaces
+    expiresAt: old.expiresAt,
     positionSide: old.positionSide,
     replaceOrderId: old.id,
   });
@@ -89,7 +95,7 @@ export async function modifyOrder(
 // Cancel is idempotent: cancelling a cancelled order returns it, a filled order is reported.
 export async function cancelOrder(userId: string, accountId: string, orderId: string) {
   await assertOwner(userId, accountId);
-  return prisma.$transaction(async (tx) => {
+  const result = await prisma.$transaction(async (tx) => {
     await lockAccount(tx, accountId);
     const order = await tx.order.findFirst({ where: { id: orderId, accountId } });
     if (!order) throw ApiError.notFound('Order not found');
@@ -97,13 +103,15 @@ export async function cancelOrder(userId: string, accountId: string, orderId: st
     if (order.status === 'CANCELED' || order.status === 'REJECTED') return order;
     return cancelOrderRow(tx, order.id, 'USER');
   });
+  tradingEvents.accountChanged(accountId, 'cancel');
+  return result;
 }
 
 // Cancels every working order (entries AND exits), optionally for one symbol / side.
 // Position closing and advanced jobs are separate actions.
 export async function cancelAllOrders(userId: string, accountId: string, filter: { symbol?: string; side?: OrderSide } = {}) {
   await assertOwner(userId, accountId);
-  return prisma.$transaction(async (tx) => {
+  const outcome = await prisma.$transaction(async (tx) => {
     await lockAccount(tx, accountId);
     const market = filter.symbol ? await tx.market.findUnique({ where: { symbol: filter.symbol.toUpperCase() } }) : null;
     if (filter.symbol && !market) throw ApiError.notFound('Market not found');
@@ -118,10 +126,12 @@ export async function cancelAllOrders(userId: string, accountId: string, filter:
     });
     return { canceled: result.count };
   });
+  if (outcome.canceled > 0) tradingEvents.accountChanged(accountId, 'cancel');
+  return outcome;
 }
 
-// Closes a position (or part of it) with a reduce-only market order at the live book.
-// The book may be too thin: the result then shows a partial fill and the rest stays open.
+// Closes a position (or part of it) with a reduce-only market order at the fresh server mark price (taker fee).
+// A partial close that would leave less than the minimum order value is rejected (close the whole position instead).
 export async function closePosition(
   userId: string,
   accountId: string,
@@ -172,9 +182,11 @@ export async function closeAllPositions(userId: string, accountId: string, only?
   return { results };
 }
 
-// One-way <-> hedge. Only allowed while the account is completely flat.
+// Position mode. Spec v1: ONE net position per symbol, there is no hedge mode for traders.
+// Setting ONE_WAY is accepted (it is the only mode), HEDGE is refused.
 export async function setPositionMode(userId: string, accountId: string, mode: PositionMode) {
   await assertOwner(userId, accountId);
+  if (mode === 'HEDGE') throw ApiError.unprocessable('HEDGE_NOT_AVAILABLE', 'Hedge mode is not available. Every symbol has one net position.');
   return prisma.$transaction(async (tx) => {
     await lockAccount(tx, accountId);
     const [positions, orders] = await Promise.all([
@@ -202,38 +214,13 @@ export async function listMyAccounts(userId: string) {
 export async function getAccountOverview(userId: string, accountId: string) {
   const account = await assertOwner(userId, accountId);
   const snapshot = await prisma.$transaction((tx) => computeAccountSnapshot(tx, accountId));
-  return {
-    id: account.id,
-    stage: account.stage,
-    status: account.status,
-    positionMode: snapshot.positionMode,
-    startingBalance: account.startingBalance.toString(),
-    balance: snapshot.balance.toString(),
-    unrealizedPnl: snapshot.unrealizedPnl.toString(),
-    equity: snapshot.equity.toString(),
-    marginUsed: snapshot.marginUsed.toString(),
-    reservedMargin: snapshot.reservedMargin.toString(),
-    freeMargin: snapshot.freeMargin.toString(),
-    availableMargin: snapshot.availableMargin.toString(),
-    maintenanceMarginRef: snapshot.maintenanceMarginRef.toString(),
-    grossExposure: snapshot.grossExposure.toString(),
-    grossExposureLimit: snapshot.grossExposureLimit.toString(),
-    overCap: snapshot.overCap,
-    positions: snapshot.positions.map((p) => ({
-      id: p.positionId,
-      symbol: p.symbol,
-      side: p.side,
-      size: p.size.toString(),
-      entryPrice: p.entryPrice.toString(),
-      markPrice: p.markPrice.toString(),
-      notional: p.notional.toString(),
-      leverage: p.leverage,
-      margin: p.margin.toString(),
-      maintenanceMarginRef: p.maintenanceMarginRef.toString(),
-      unrealizedPnl: p.unrealizedPnl.toString(),
-      liquidationPrice: null,
-    })),
-  };
+  return presentAccountOverview(account, snapshot);
+}
+
+// Trade preview for the order ticket: read only, nothing is reserved or written.
+export async function previewTrade(userId: string, input: PreviewInput) {
+  await assertOwner(userId, input.accountId);
+  return prisma.$transaction((tx) => previewOrder(tx, input));
 }
 
 export async function listOrders(userId: string, accountId: string, opts: { limit?: number; active?: boolean } = {}) {
@@ -270,4 +257,3 @@ export async function listLedger(userId: string, accountId: string, limit = 100)
   await assertOwner(userId, accountId);
   return prisma.ledgerEntry.findMany({ where: { accountId }, orderBy: { createdAt: 'desc' }, take: limit });
 }
-

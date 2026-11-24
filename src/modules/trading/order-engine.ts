@@ -9,18 +9,23 @@ import { resolveMark } from './account-snapshot';
 import { applyFill, initialMargin, scaleMarginOnReduce } from './engine/calculations';
 import { checkNewExposure, computeMetrics, symbolSideNotional, type Leg, type WorkingExposure } from './engine/exposure';
 import { feeAmount, resolveFeeRate, roundLedger, type LiquidityKind } from './engine/fees';
-import { isMarketable, isTriggered, restingLimitCrossed, type Quote, type TriggerOrderType } from './engine/matching';
 import {
-  bestAsk,
-  bestBid,
-  consumeBook,
-  eligibleSize,
-  levelsToJson,
-  midPrice,
-  slippagePct,
-  type BookLevel,
-  type BookSnapshot,
-} from './engine/orderbook';
+  isMarketable,
+  isTriggered,
+  marketableLimitFillPrice,
+  restingLimitCrossed,
+  triggerFillPrice,
+  type Quote,
+  type TriggerOrderType,
+} from './engine/matching';
+import {
+  isDivergenceExceeded,
+  maxNotionalByLiquidity,
+  ORDER_RATE_PER_MINUTE,
+  ORDER_RATE_PER_SECOND,
+  residualTooSmall,
+} from './engine/market-policy';
+import { bestAsk, bestBid, levelsToJson, type BookLevel, type BookSnapshot } from './engine/orderbook';
 import { classifyOrder, closingLegOf, openingSideOf, type Classification } from './engine/positions';
 import { checkPrice, checkSize } from './engine/validation';
 
@@ -30,9 +35,12 @@ import { checkPrice, checkSize } from './engine/validation';
 // Rules that every path follows:
 //  1. The account row is locked first, so orders of one account run one at a time.
 //  2. All validation happens BEFORE any write. A rejected order leaves the transaction clean.
-//  3. Fills come from ONE consistent order book snapshot (VWAP over the consumed levels).
+//  3. The server MARK price is the only execution price (spec v1.0): market orders fill at the fresh mark with zero
+//     slippage, resting limits fill at their saved limit price, stops fill at the trigger (or at the first fresh mark after
+//     an outage). The order book only decides marketability and the liquidity guard.
 //  4. Balance changes only through the ledger (realized PnL and fee per fill).
-//  5. Cross margin: equity = balance + floating PnL, available = equity - initial margin - reserved margin.
+//  5. Cross margin: new-entry capacity = max(0, min(balance, equity) - used margin - pending margin).
+//  6. Entries are all-or-unfilled (no partial opening fills). Closing orders are capped to the open position.
 // =====================================================================
 
 export type PlaceableType = 'MARKET' | 'LIMIT' | 'STOP_MARKET' | 'TAKE_PROFIT' | 'STOP_LOSS';
@@ -60,11 +68,11 @@ export interface OrderParams {
   leverage: number;
   reduceOnly: boolean;
   postOnly?: boolean;
+  // Only GTC exists in v1 (IOC / FOK are not enabled); resting limit orders expire at expiresAt
   timeInForce?: TimeInForce;
+  expiresAt?: Date | null;
   // Hedge mode: the leg the order targets
   positionSide?: PositionSide | null;
-  // Opening market orders only (percent, 3 = 3 percent)
-  maxSlippagePct?: Decimal | null;
   clientOrderId?: string;
   // Risk engine closes: skips account / margin / halt checks and accepts a fallback price
   force?: boolean;
@@ -101,11 +109,15 @@ interface PosRow {
   margin: Decimal;
   leverage: number;
   markPrice: Decimal;
+  // Maximum leverage the symbol permits (maintenance margin input)
+  maxLeverage: number;
 }
 
-interface EngineState {
+export interface EngineState {
   balance: Decimal;
   mode: 'ONE_WAY' | 'HEDGE';
+  // Gross exposure cap as a multiple of CURRENT equity (plan setting: 10, Instant 3)
+  grossMultiple: number;
   // Every open leg of the account (all markets)
   rows: PosRow[];
   // Working opening orders that reserve margin (without the ignored ones)
@@ -113,10 +125,13 @@ interface EngineState {
   settings: Awaited<ReturnType<typeof getSetting<'trading'>>>;
 }
 
-async function loadState(tx: Tx, accountId: string, ignore: ReadonlySet<string>): Promise<EngineState> {
+export async function loadState(tx: Tx, accountId: string, ignore: ReadonlySet<string>): Promise<EngineState> {
   const [account, positions, orders, settings] = await Promise.all([
-    tx.tradingAccount.findUniqueOrThrow({ where: { id: accountId }, select: { balance: true, positionMode: true } }),
-    tx.position.findMany({ where: { accountId, size: { gt: 0 } }, include: { market: { select: { symbol: true } } } }),
+    tx.tradingAccount.findUniqueOrThrow({
+      where: { id: accountId },
+      select: { balance: true, positionMode: true, plan: { select: { grossExposureMultiple: true } } },
+    }),
+    tx.position.findMany({ where: { accountId, size: { gt: 0 } }, include: { market: { select: { symbol: true, maxLeverage: true } } } }),
     tx.order.findMany({
       where: { accountId, status: { in: [...ACTIVE_STATUSES] }, reservedMargin: { gt: 0 }, id: { notIn: [...ignore] } },
       include: { market: { select: { symbol: true } } },
@@ -127,6 +142,7 @@ async function loadState(tx: Tx, accountId: string, ignore: ReadonlySet<string>)
   return {
     balance: toD(account.balance),
     mode: account.positionMode,
+    grossMultiple: account.plan.grossExposureMultiple,
     rows: positions.map((p) => ({
       id: p.id,
       marketId: p.marketId,
@@ -137,6 +153,7 @@ async function loadState(tx: Tx, accountId: string, ignore: ReadonlySet<string>)
       margin: toD(p.margin),
       leverage: p.leverage,
       markPrice: toD(p.markPrice),
+      maxLeverage: p.market.maxLeverage,
     })),
     working: orders.map((o) => ({
       marketKey: o.market.symbol,
@@ -149,10 +166,10 @@ async function loadState(tx: Tx, accountId: string, ignore: ReadonlySet<string>)
   };
 }
 
-const rowKey = (marketId: string, side: PositionSide) => `${marketId}:${side}`;
+export const rowKey = (marketId: string, side: PositionSide) => `${marketId}:${side}`;
 
 // Legs of the whole account with their marks. The traded market uses the given mark.
-function legsFromRows(rows: PosRow[], thisSymbol: string, thisMark: Decimal): Leg[] {
+export function legsFromRows(rows: PosRow[], thisSymbol: string, thisMark: Decimal): Leg[] {
   return rows.map((r) => ({
     marketKey: r.symbol,
     side: r.side,
@@ -160,11 +177,12 @@ function legsFromRows(rows: PosRow[], thisSymbol: string, thisMark: Decimal): Le
     entryPrice: r.entryPrice,
     mark: r.symbol === thisSymbol ? thisMark : resolveMark(r.symbol, r.markPrice),
     margin: r.margin,
+    maxLeverage: r.maxLeverage,
   }));
 }
 
 // Margin + fee buffer held for the unfilled opening part of a resting order.
-function reservationFor(remaining: Decimal, price: Decimal, leverage: number, takerRate: Decimal): Decimal {
+export function reservationFor(remaining: Decimal, price: Decimal, leverage: number, takerRate: Decimal): Decimal {
   const notional = remaining.mul(price);
   return notional.div(leverage).plus(notional.mul(takerRate)).toDecimalPlaces(8, Decimal.ROUND_UP);
 }
@@ -174,7 +192,7 @@ function reservationFor(remaining: Decimal, price: Decimal, leverage: number, ta
 interface Execution {
   size: Decimal;
   notional: Decimal;
-  // Exact (unrounded) VWAP, or the limit price for maker fills
+  // The execution price: the fresh mark, the saved limit price (maker) or the saved trigger price (stop)
   price: Decimal;
   liquidity: LiquidityKind;
   levels: BookLevel[];
@@ -228,17 +246,16 @@ function enforceExposure(args: {
   openSide: PositionSide;
 }) {
   const { state, market, thisMark } = args;
-  const mmr = state.settings.mmrFractionOfImr;
   const legsBefore = legsFromRows(state.rows, market.symbol, thisMark);
   const legsAfter = legsFromRows(args.rowsAfter, market.symbol, thisMark);
 
-  const before = computeMetrics(state.balance, legsBefore, args.workingBefore, mmr);
-  const after = computeMetrics(args.balanceAfter, legsAfter, args.workingAfter, mmr);
+  const before = computeMetrics(state.balance, legsBefore, args.workingBefore);
+  const after = computeMetrics(args.balanceAfter, legsAfter, args.workingAfter);
 
   const rejection = checkNewExposure({
     before,
     after,
-    grossMultiple: state.settings.grossExposureMultiple,
+    grossMultiple: state.grossMultiple,
     symbolSideNotionalAfter: symbolSideNotional(legsAfter, args.workingAfter, market.symbol, args.openSide),
     symbolSideCap: market.maxNotionalUsd ? toD(market.maxNotionalUsd) : null,
     increasesExposure: true,
@@ -247,11 +264,12 @@ function enforceExposure(args: {
 
   const messages = {
     POSITION_CAP: `Position limit for ${market.symbol} would be exceeded`,
-    GROSS_EXPOSURE_CAP: `Total exposure would exceed ${state.settings.grossExposureMultiple}x your equity`,
-    INSUFFICIENT_MARGIN: 'Not enough free margin for this order',
+    GROSS_EXPOSURE_CAP: `Total exposure would exceed ${state.grossMultiple}x your equity`,
+    INSUFFICIENT_MARGIN: 'Not enough margin capacity for this order',
   } as const;
   reject(rejection, messages[rejection], {
-    availableMargin: after.availableMargin.toFixed(8),
+    marginCapacity: before.availableMargin.toFixed(6),
+    marginCapacityAfter: after.marginCapacityRaw.toFixed(6),
     grossExposure: after.grossWithOrders.toFixed(2),
     equity: after.equity.toFixed(8),
   });
@@ -342,6 +360,7 @@ async function settle(tx: Tx, order: Order, market: Market, exec: Execution, opt
           margin: n.margin,
           leverage: n.leverage,
           markPrice: exec.mark,
+          maxLeverage: market.maxLeverage,
         });
       }
     }
@@ -453,7 +472,7 @@ async function settle(tx: Tx, order: Order, market: Market, exec: Execution, opt
   if (opts.residual && !order.reduceOnly && ACTIVE_STATUSES.includes(opts.afterStatus as 'NEW')) {
     // Legs of this market after the fill: untouched legs stay as they are
     const afterRows = new Map<string, PosRow>(state.rows.filter((r) => r.marketId === market.id).map((r) => [rowKey(r.marketId, r.side), r]));
-    for (const [side, n] of next) afterRows.set(rowKey(market.id, side as PositionSide), { id: '', marketId: market.id, symbol: market.symbol, side: side as PositionSide, size: n.size, entryPrice: n.entry, margin: n.margin, leverage: n.leverage, markPrice: exec.mark });
+    for (const [side, n] of next) afterRows.set(rowKey(market.id, side as PositionSide), { id: '', marketId: market.id, symbol: market.symbol, side: side as PositionSide, size: n.size, entryPrice: n.entry, margin: n.margin, leverage: n.leverage, markPrice: exec.mark, maxLeverage: market.maxLeverage });
     const portion = openingPortion(state, order, market.id, afterRows, opts.residual.remaining);
     const takerRate = resolveFeeRate({ marketType: market.marketType, liquidity: 'TAKER', schedule: state.settings.fees, makerOverride: market.makerFeeRate, takerOverride: market.takerFeeRate });
     reserved = reservationFor(portion, opts.residual.price, leverage, takerRate);
@@ -519,31 +538,35 @@ async function cancelReduceOnlyOrders(tx: Tx, accountId: string, marketId: strin
 
 // ------------------------------ live quotes ----------------------------
 
-interface LiveQuote {
+export interface LiveQuote {
   book: BookSnapshot;
   mark: Decimal;
+  // When the mark was received (a resting limit order needs a mark that is LATER than its acceptance)
+  markAt: number;
   synthetic: boolean;
 }
 
 const HUGE = new Decimal('1e18');
 
-// The data a fill is allowed to use. Stale data blocks trading; only forced closes (risk engine)
-// may fall back to the last known price.
-function liveQuote(symbol: string, force: boolean, override?: PriceInput, storedMark?: Decimal): LiveQuote {
+// The data a fill is allowed to use. Stale data blocks trading (mark older than the hard limit, spec: 5 s);
+// only forced closes (risk engine) may fall back to the last known price.
+export function liveQuote(symbol: string, force: boolean, override?: PriceInput, storedMark?: Decimal): LiveQuote {
   const book = priceFeed.getBook(symbol);
   const mark = priceFeed.getMark(symbol);
 
-  if (priceFeed.isFresh(symbol) && book && mark) return { book, mark: mark.mark, synthetic: false };
+  if (priceFeed.isFresh(symbol) && book && mark) return { book, mark: mark.mark, markAt: mark.receivedAt, synthetic: false };
 
   if (!force) {
     reject('MARKET_FEED_STALE', 'Price is outdated, trading is temporarily blocked', {
+      feedStatus: priceFeed.feedStatus(symbol),
       bookFresh: priceFeed.isBookFresh(symbol),
       markFresh: priceFeed.isMarkFresh(symbol),
+      markAgeMs: priceFeed.markAgeMs(symbol),
     });
   }
 
   const markValue = (priceFeed.isMarkFresh(symbol) ? mark?.mark : undefined) ?? override?.mid ?? storedMark ?? mark?.mark;
-  if (priceFeed.isBookFresh(symbol) && book && markValue) return { book, mark: markValue, synthetic: false };
+  if (priceFeed.isBookFresh(symbol) && book && markValue) return { book, mark: markValue, markAt: mark?.receivedAt ?? Date.now(), synthetic: false };
   if (!override && !markValue) reject('MARKET_FEED_STALE', 'No price is available for this market');
 
   const mid = override?.mid ?? markValue!;
@@ -559,37 +582,41 @@ function liveQuote(symbol: string, force: boolean, override?: PriceInput, stored
       seq: 0,
     },
     mark: markValue ?? mid,
+    markAt: Date.now(),
     synthetic: true,
   };
 }
 
-// Takes liquidity from the book. Forced closes continue at the worst visible price when the book is too thin.
-function takerExecution(quote: LiveQuote, side: OrderSide, size: Decimal, limit: Decimal | null, force: boolean): Execution {
-  const result = consumeBook(quote.book, side, size, limit);
-  let taken = result.taken;
-  let notional = result.notional;
-  let filled = result.filledSize;
-  let synthetic = quote.synthetic;
-
-  if (force && result.exhausted && !limit) {
-    const rest = size.minus(filled);
-    const worst = taken.length ? taken[taken.length - 1].price : (side === 'BUY' ? bestAsk(quote.book) : bestBid(quote.book)) ?? quote.mark;
-    taken = [...taken, { price: worst, size: rest }];
-    notional = notional.plus(worst.mul(rest));
-    filled = size;
-    synthetic = true;
-  }
-
+// One execution of the FULL size at the given price (no slippage model, no partial entry fills).
+function markExecution(quote: LiveQuote, price: Decimal, size: Decimal, liquidity: LiquidityKind): Execution {
+  const level: BookLevel = { price, size };
   return {
-    size: filled,
-    notional,
-    price: filled.gt(0) ? notional.div(filled) : ZERO,
-    liquidity: 'TAKER',
-    levels: taken,
+    size,
+    notional: size.mul(price),
+    price,
+    liquidity,
+    levels: [level],
     bookTime: quote.book.exchangeTime ?? quote.book.receivedAt,
     mark: quote.mark,
-    synthetic,
+    synthetic: quote.synthetic,
   };
+}
+
+// Liquidity guard (spec section 5): a single opening entry may not exceed 10 percent of the 30 second robust median
+// visible relevant-side depth within 1 percent of the mark. Returns null while no depth sample exists yet.
+export function liquidityLimitUsd(symbol: string, side: OrderSide): Decimal | null {
+  const depth = priceFeed.robustDepthUsd(symbol, side);
+  return depth ? maxNotionalByLiquidity(depth) : null;
+}
+
+function assertLiquidity(symbol: string, side: OrderSide, notional: Decimal) {
+  const cap = liquidityLimitUsd(symbol, side);
+  if (!cap) reject('LIQUIDITY_UNAVAILABLE', 'Order book depth is not available yet, try again in a moment');
+  if (notional.gt(cap!)) {
+    reject('LIQUIDITY_GUARD', `This order is larger than the visible liquidity allows (maximum ${cap!.toFixed(2)} USD)`, {
+      maxNotionalUsd: cap!.toFixed(2),
+    });
+  }
 }
 
 // ----------------------------- submit order ----------------------------
@@ -639,11 +666,9 @@ export async function submitOrder(tx: Tx, params: OrderParams): Promise<OrderRes
   // ---- order shape ----
   if (type === 'MARKET' && (params.limitPrice || params.triggerPrice)) reject('INVALID_ORDER', 'A market order has no price');
   if (type === 'LIMIT' && !params.limitPrice) reject('INVALID_ORDER', 'A limit order needs a limit price');
-  if (type !== 'LIMIT' && (params.postOnly || params.timeInForce === 'IOC')) {
-    if (params.postOnly) reject('INVALID_ORDER', 'Post-only is only available for limit orders');
-    if (type !== 'MARKET') reject('INVALID_ORDER', 'IOC is only available for limit orders');
-  }
-  if (params.postOnly && params.timeInForce === 'IOC') reject('INVALID_ORDER', 'Post-only and IOC cannot be combined');
+  if (type !== 'LIMIT' && params.postOnly) reject('INVALID_ORDER', 'Post-only is only available for limit orders');
+  if (params.timeInForce === 'IOC') reject('INVALID_ORDER', 'IOC orders are not enabled in this version');
+  if (params.expiresAt && type !== 'LIMIT') reject('INVALID_ORDER', 'Expiry is only available for limit orders');
   if (type === 'STOP_MARKET' && reduceOnly) reject('INVALID_ORDER', 'Use a stop-loss order to close a position');
   if ((type === 'STOP_MARKET' || exit) && !params.triggerPrice) reject('INVALID_ORDER', 'A trigger price is required');
   if (params.closePosition && !exit && !reduceOnly) reject('INVALID_ORDER', 'closePosition requires a reduce-only order');
@@ -688,13 +713,30 @@ export async function submitOrder(tx: Tx, params: OrderParams): Promise<OrderRes
 
   if ((reduceOnly || exit) && !force) {
     if (!heldLeg) reject('NO_POSITION', 'There is no open position to reduce');
-    if (!params.closePosition && size.gt(toD(heldLeg!.size))) reject('REDUCE_ONLY_EXCESS', 'Order is larger than the position it would reduce');
+    // Spec: a reduce-only / exit order never reverses or enlarges a position, its size is capped to the open quantity
+    if (!params.closePosition && size.gt(toD(heldLeg!.size))) size = toD(heldLeg!.size);
   }
 
   const cls = classifyOrder(mode, params.side, positionSide, legState('LONG'), legState('SHORT'), size);
   if (cls.exceedsLeg) reject('REDUCE_ONLY_EXCESS', 'Order is larger than the position it would reduce');
   if (reduceOnly && cls.openSize.gt(0)) reject('REDUCE_ONLY', 'Reduce-only order would not reduce a position');
   const opens = cls.openSize.gt(0) || type === 'STOP_MARKET' || (type === 'LIMIT' && !reduceOnly && mode === 'HEDGE' && cls.openSize.gt(0));
+
+  // New exposure pauses while the book and the mark disagree too much (spec: 0.75 % BTC / ETH / SOL, 1.5 % others)
+  if (opens && !force && isDivergenceExceeded(mkt.symbol, priceFeed.divergencePct(mkt.symbol))) {
+    reject('MARKET_PRICE_DIVERGENCE', `New ${mkt.symbol} positions are paused because the order book and the mark price disagree`, {
+      divergencePct: priceFeed.divergencePct(mkt.symbol)?.toFixed(4),
+    });
+  }
+  // A partial close may not leave a dust position below the minimum order value
+  if (!force && !params.closePosition && type === 'MARKET' && reduceOnly && heldLeg) {
+    const residual = toD(heldLeg.size).minus(size);
+    if (residualTooSmall(residual, quote.mark, mkt.minNotionalUsd)) {
+      reject('RESIDUAL_BELOW_MIN', `This partial close would leave less than ${mkt.minNotionalUsd.toString()} USD open. Close the whole position instead.`, {
+        residualSize: residual.toFixed(),
+      });
+    }
+  }
 
   // ---- leverage, caps, switches ----
   const leverageCap = Math.min(mkt.maxLeverage, account.plan.maxLeverage);
@@ -716,7 +758,7 @@ export async function submitOrder(tx: Tx, params: OrderParams): Promise<OrderRes
     reject('INVALID_TICK', `Trigger price must be a multiple of ${mkt.priceTick.toString()} (max 5 significant figures)`);
   }
 
-  const refPrice = params.limitPrice ?? midPrice(quote.book) ?? quote.mark;
+  const refPrice = params.limitPrice ?? quote.mark;
   if (opens && !force && size.mul(refPrice).lt(toD(mkt.minNotionalUsd))) {
     reject('BELOW_MIN_NOTIONAL', `Minimum order value for ${mkt.symbol} is ${mkt.minNotionalUsd.toString()} USD`, { minimum: mkt.minNotionalUsd.toString() });
   }
@@ -734,6 +776,17 @@ export async function submitOrder(tx: Tx, params: OrderParams): Promise<OrderRes
       where: { accountId: params.accountId, status: { in: [...ACTIVE_STATUSES] }, reduceOnly: false, type: { in: ['LIMIT', 'STOP_MARKET'] }, id: { notIn: [...ignore] } },
     });
     if (openOrders >= settings.maxOpenOrders) reject('OPEN_ORDER_LIMIT', `At most ${settings.maxOpenOrders} open orders are allowed`);
+  }
+  // Exposure-increasing requests per account (reduce-only exits are exempt): 5 per second and 120 per minute
+  if (opens && !force) {
+    const now = Date.now();
+    const [lastSecond, lastMinute] = await Promise.all([
+      tx.order.count({ where: { accountId: params.accountId, reduceOnly: false, createdAt: { gte: new Date(now - 1_000) } } }),
+      tx.order.count({ where: { accountId: params.accountId, reduceOnly: false, createdAt: { gte: new Date(now - 60_000) } } }),
+    ]);
+    if (lastSecond >= ORDER_RATE_PER_SECOND || lastMinute >= ORDER_RATE_PER_MINUTE) {
+      throw new ApiError(429, 'ORDER_RATE_LIMIT', `Too many new-exposure orders (maximum ${ORDER_RATE_PER_SECOND} per second and ${ORDER_RATE_PER_MINUTE} per minute)`);
+    }
   }
   if (exit && !force) {
     const legOrders = await tx.order.findMany({
@@ -756,37 +809,19 @@ export async function submitOrder(tx: Tx, params: OrderParams): Promise<OrderRes
     if (legs >= settings.maxPositionLegs) reject('OPEN_POSITION_LIMIT', `At most ${settings.maxPositionLegs} open positions are allowed`);
   }
 
-  // ---- slippage setting (opening market orders) ----
-  let slippageLimit: Decimal | null = null;
-  if (type === 'MARKET' && cls.openSize.gt(0)) {
-    slippageLimit = params.maxSlippagePct ?? toD(settings.defaultOpenSlippagePct);
-    if (slippageLimit.lte(0) || slippageLimit.gt(settings.maxOpenSlippagePct)) {
-      reject('INVALID_SLIPPAGE', `Slippage must be between 0 and ${settings.maxOpenSlippagePct} percent`);
-    }
-  }
-
-  // ---- limit orders: post-only ----
+  // ---- limit orders: marketability at acceptance and post-only ----
   const marketable = type === 'LIMIT' ? isMarketable(params.side, params.limitPrice!, q) : false;
   if (type === 'LIMIT' && params.postOnly && marketable) {
     reject('POST_ONLY_WOULD_TAKE', 'A post-only order would execute immediately. Choose a price that rests in the book.');
   }
 
-  // ---- market execution plan (validated before writing anything) ----
-  let marketExec: Execution | null = null;
-  if (type === 'MARKET') {
-    marketExec = takerExecution(quote, params.side, size, null, force);
-    const best = params.side === 'BUY' ? bestAsk(quote.book) : bestBid(quote.book);
-    if (marketExec.size.lte(0)) reject('VISIBLE_BOOK_TOO_THIN', 'No liquidity is available in the order book');
-    if (cls.openSize.gt(0)) {
-      // Opening / adding / reversing: the WHOLE size must be available within the slippage limit
-      if (marketExec.size.lt(size)) reject('VISIBLE_BOOK_TOO_THIN', 'The order book is too thin for this size', { visible: marketExec.size.toFixed() });
-      if (!force && best && slippageLimit) {
-        const slip = slippagePct(params.side, marketExec.price, best);
-        if (slip.gt(slippageLimit)) {
-          reject('OPEN_SLIPPAGE_EXCEEDED', `Slippage ${slip.toFixed(4)}% is above your limit of ${slippageLimit.toFixed()}%`, { slippagePct: slip.toFixed(4) });
-        }
-      }
-    }
+  // ---- execution plan of an order that fills now (validated before anything is written) ----
+  // Market: the fresh mark. Marketable limit: the fresh mark, never worse than the limit. Both are TAKER fills of the full size.
+  let planned: Execution | null = null;
+  if (type === 'MARKET' || marketable) {
+    const price = type === 'MARKET' ? quote.mark : marketableLimitFillPrice(params.side, params.limitPrice!, quote.mark);
+    planned = markExecution(quote, price, size, 'TAKER');
+    if (cls.openSize.gt(0) && !force) assertLiquidity(mkt.symbol, params.side, cls.openSize.mul(price));
   }
 
   // ----------------------------- create the order -----------------------------
@@ -805,9 +840,10 @@ export async function submitOrder(tx: Tx, params: OrderParams): Promise<OrderRes
       leverage,
       reduceOnly,
       positionSide,
-      timeInForce: params.timeInForce ?? 'GTC',
+      timeInForce: 'GTC',
       postOnly: !!params.postOnly,
-      maxSlippagePct: slippageLimit?.toFixed(),
+      // Resting limit orders expire at this time (null = good till cancelled)
+      expiresAt: type === 'LIMIT' && !marketable ? (params.expiresAt ?? null) : null,
     },
   });
 
@@ -815,45 +851,13 @@ export async function submitOrder(tx: Tx, params: OrderParams): Promise<OrderRes
   let current = order;
   const settleOpts = { enforce: !force, ignoreOrderIds: ignore };
 
-  if (type === 'MARKET') {
-    const exec = marketExec!;
-    const done = exec.size.gte(size);
-    const result = await settle(tx, order, mkt, exec, {
-      ...settleOpts,
-      afterStatus: done ? 'FILLED' : 'CANCELED',
-      residual: null,
-      cancelReason: done ? undefined : 'PARTIAL_DEPTH',
-    });
+  if (planned) {
+    const result = await settle(tx, order, mkt, planned, { ...settleOpts, afterStatus: 'FILLED', residual: null });
     fills.push(result.fill);
     current = result.order;
   } else if (type === 'LIMIT') {
-    const limit = params.limitPrice!;
-    let remaining = size;
-
-    if (marketable) {
-      const exec = takerExecution(quote, params.side, size, limit, false);
-      if (exec.size.gt(0)) {
-        remaining = size.minus(exec.size);
-        const rests = remaining.gt(0) && (params.timeInForce ?? 'GTC') === 'GTC';
-        const result = await settle(tx, order, mkt, exec, {
-          ...settleOpts,
-          afterStatus: remaining.lte(0) ? 'FILLED' : rests ? 'PARTIALLY_FILLED' : 'CANCELED',
-          residual: rests ? { remaining, price: limit } : null,
-          cancelReason: remaining.gt(0) && !rests ? 'IOC_REMAINDER' : undefined,
-        });
-        fills.push(result.fill);
-        current = result.order;
-      }
-    }
-
-    // Nothing filled: IOC is cancelled, GTC rests (and reserves margin when it opens)
-    if (fills.length === 0) {
-      if ((params.timeInForce ?? 'GTC') === 'IOC') {
-        current = await tx.order.update({ where: { id: order.id }, data: { status: 'CANCELED', cancelReason: 'NO_LIQUIDITY' } });
-      } else {
-        current = await restOrder(tx, order, mkt, ignore, force, quote.mark);
-      }
-    }
+    // Not marketable: the order rests until a later fresh mark crosses the limit (reserves margin when it opens)
+    current = await restOrder(tx, order, mkt, ignore, force, quote.mark);
   }
   // STOP_MARKET, TAKE_PROFIT and STOP_LOSS stay armed (NEW) until the matcher triggers them.
 
@@ -904,10 +908,18 @@ export interface WorkingOutcome {
   filled: Decimal;
 }
 
-// Evaluates ONE working order against the live market: resting limits fill as maker when the book
-// touches the limit, stops / TP / SL fire as taker. Called by the order matcher inside a transaction.
-//   eligibleBudget = visible liquidity this limit order may still use in the current sweep
-export async function processWorkingOrder(tx: Tx, orderId: string, eligibleBudget: Decimal): Promise<WorkingOutcome> {
+export interface WorkingContext {
+  // True for the first fresh mark after a data outage (or after a restart): stops then fill at that mark
+  afterGap: boolean;
+}
+
+// Evaluates ONE working order against the live market (called by the order matcher inside a transaction):
+//  * resting limit : fills in full at its saved limit price (maker) when a fresh mark that arrived AFTER the order
+//                    was accepted crosses the limit and the liquidity guard still passes
+//  * stop / TP / SL: fires when the MARK touches the trigger. Fill price = trigger price, or the first fresh mark
+//                    after an outage. Exits are capped to the open position.
+//  * expiry        : a resting limit order past its expiry is cancelled and its margin reservation is released
+export async function processWorkingOrder(tx: Tx, orderId: string, ctx: WorkingContext): Promise<WorkingOutcome> {
   const none: WorkingOutcome = { filled: ZERO };
   const peek = await tx.order.findUnique({ where: { id: orderId }, select: { accountId: true } });
   if (!peek) return none;
@@ -920,6 +932,12 @@ export async function processWorkingOrder(tx: Tx, orderId: string, eligibleBudge
   const account = await tx.tradingAccount.findUniqueOrThrow({ where: { id: order.accountId }, select: { status: true } });
   if (account.status !== 'ACTIVE') {
     await cancelOrderRow(tx, order.id, 'ACCOUNT_INACTIVE');
+    return none;
+  }
+
+  // Expiry does not depend on prices
+  if (order.expiresAt && order.expiresAt.getTime() <= Date.now()) {
+    await cancelOrderRow(tx, order.id, 'EXPIRED');
     return none;
   }
 
@@ -940,7 +958,9 @@ export async function processWorkingOrder(tx: Tx, orderId: string, eligibleBudge
   const book = priceFeed.getBook(market.symbol);
   const mark = priceFeed.getMark(market.symbol);
   if (!book || !mark || !priceFeed.isFresh(market.symbol)) return none;
-  const quote: LiveQuote = { book, mark: mark.mark, synthetic: false };
+  // New entries wait while the book and the mark disagree too much (exits stay possible)
+  if (opening && isDivergenceExceeded(market.symbol, priceFeed.divergencePct(market.symbol))) return none;
+  const quote: LiveQuote = { book, mark: mark.mark, markAt: mark.receivedAt, synthetic: false };
   const q: Quote = { bid: bestBid(book), ask: bestAsk(book), mark: mark.mark };
 
   const remaining = toD(order.size).minus(toD(order.filledSize));
@@ -973,33 +993,26 @@ export async function processWorkingOrder(tx: Tx, orderId: string, eligibleBudge
   // ---------------------------- resting limit ----------------------------
   if (order.type === 'LIMIT') {
     const limit = toD(order.limitPrice!);
-    if (!restingLimitCrossed(order.side, limit, q, market.requireMarkConfirm)) return none;
+    // The order must survive at least one later fresh market update before it can fill
+    if (mark.receivedAt <= order.createdAt.getTime()) return none;
+    if (!restingLimitCrossed(order.side, limit, mark.mark)) return none;
 
+    // Entries are all-or-unfilled. A reduce-only limit is capped to the open position.
     let want = order.reduceOnly ? Decimal.min(remaining, legSize) : remaining;
-    want = Decimal.min(want, eligibleSize(book, order.side, limit), eligibleBudget);
-    // Keep the size on the market's step grid
     const step = toD(market.sizeStep);
     if (step.gt(0)) want = want.div(step).floor().mul(step);
     if (want.lte(0)) return none;
 
-    // Resting orders trade at their limit price as maker
-    const exec: Execution = {
-      size: want,
-      notional: limit.mul(want),
-      price: limit,
-      liquidity: 'MAKER',
-      levels: [{ price: limit, size: want }],
-      bookTime: book.exchangeTime ?? book.receivedAt,
-      mark: mark.mark,
-      synthetic: false,
-    };
-    const left = remaining.minus(want);
+    // The liquidity guard is checked again at the moment of the fill; the order keeps waiting when it fails
+    if (opening) {
+      const cap = liquidityLimitUsd(market.symbol, order.side);
+      if (!cap || want.mul(limit).gt(cap)) return none;
+    }
+
+    // Resting orders trade at their saved limit price as maker
+    const exec = markExecution(quote, limit, want, 'MAKER');
     try {
-      const result = await settle(tx, order, market, exec, {
-        enforce: true,
-        afterStatus: left.lte(0) ? 'FILLED' : 'PARTIALLY_FILLED',
-        residual: left.gt(0) ? { remaining: left, price: limit } : null,
-      });
+      const result = await settle(tx, order, market, exec, { enforce: true, afterStatus: 'FILLED', residual: null });
       return { filled: toD(result.fill.size) };
     } catch (err) {
       return rejectOrder(err, 'CANCELED');
@@ -1007,28 +1020,29 @@ export async function processWorkingOrder(tx: Tx, orderId: string, eligibleBudge
   }
 
   // ------------------------ stop entry / TP / SL --------------------------
+  const trigger = toD(order.triggerPrice!);
   let triggeredAt = order.triggeredAt;
   if (!triggeredAt) {
-    if (!isTriggered(order.type as TriggerOrderType, order.side, toD(order.triggerPrice!), q)) return none;
+    if (!isTriggered(order.type as TriggerOrderType, order.side, trigger, q)) return none;
     triggeredAt = new Date();
     await tx.order.update({ where: { id: order.id }, data: { triggeredAt } });
   }
 
   const want = order.reduceOnly ? (order.closePosition ? legSize : Decimal.min(remaining, legSize)) : remaining;
-  const exec = takerExecution(quote, order.side, want, null, false);
-  if (exec.size.lte(0)) return none; // waiting for liquidity, stays armed
+  if (want.lte(0)) return none;
 
-  // An entry stop needs the whole size. Exits take what the book offers.
-  if (!order.reduceOnly && exec.size.lt(want)) return none;
+  // Continuous crossing: the saved trigger price. First fresh mark after an outage: that mark.
+  const price = triggerFillPrice(trigger, mark.mark, ctx.afterGap);
 
-  const left = order.closePosition ? legSize.minus(exec.size) : remaining.minus(exec.size);
+  // An entry stop must also pass the liquidity guard, otherwise it stays armed
+  if (opening) {
+    const cap = liquidityLimitUsd(market.symbol, order.side);
+    if (!cap || want.mul(price).gt(cap)) return none;
+  }
+
+  const exec = markExecution(quote, price, want, 'TAKER');
   try {
-    const result = await settle(tx, order, market, exec, {
-      enforce: true,
-      afterStatus: left.lte(0) ? 'FILLED' : 'PARTIALLY_FILLED',
-      residual: null,
-      triggeredAt,
-    });
+    const result = await settle(tx, order, market, exec, { enforce: true, afterStatus: 'FILLED', residual: null, triggeredAt });
     return { filled: toD(result.fill.size) };
   } catch (err) {
     return rejectOrder(err, 'REJECTED');

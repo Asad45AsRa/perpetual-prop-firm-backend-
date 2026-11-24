@@ -21,7 +21,7 @@ import { marketStats, presentTrade } from './terminal.service';
 //   {type:"book", symbol, bids:[[px,sz]..], asks:[[px,sz]..], seq, ts, depth, group}   (only if subscribed)
 //   {type:"trades", symbol, snapshot, trades:[{price,size,side,time,tid}..]}            (only if subscribed, newest first)
 //   {type:"candle", symbol, interval, t, T, o, h, l, c, v, n}                           (only if subscribed)
-//   {type:"feed", symbol, fresh, bookFresh, markFresh}                                  (when freshness CHANGES)
+//   {type:"feed", symbol, fresh, bookFresh, markFresh, feedStatus}                     (when the feed status CHANGES: LIVE / DELAYED / PAUSED)
 //   {type:"error", code}
 //   {type:"pong"}
 // Client -> server messages
@@ -71,7 +71,7 @@ export async function marketWebSocket(app: FastifyInstance) {
   const dirtyBooks = new Map<string, BookSnapshot>();
   const dirtyTrades = new Map<string, TradeTick[]>();
   const dirtyCandles = new Map<string, CandleTick>();
-  const lastFresh = new Map<string, boolean>();
+  const lastStatus = new Map<string, string>();
 
   const wants = (state: ClientState, channel: SymbolChannel, symbol: string) => !state.filter[channel] || state.filter[channel]!.has(symbol);
 
@@ -95,6 +95,9 @@ export async function marketWebSocket(app: FastifyInstance) {
       bookFresh,
       markFresh,
       fresh: bookFresh && markFresh,
+      // LIVE, DELAYED (mark older than 2 s, warning only) or PAUSED (older than 5 s, trading blocked)
+      feedStatus: priceFeed.feedStatus(tick.symbol),
+      divergencePct: priceFeed.divergencePct(tick.symbol)?.toFixed(4) ?? null,
       ts: tick.ts,
       // fundingRate + 24h statistics for the terminal market bar and markets table
       ...marketStats(tick.symbol),
@@ -196,11 +199,13 @@ export async function marketWebSocket(app: FastifyInstance) {
       const bookFresh = priceFeed.isBookFresh(symbol);
       const markFresh = priceFeed.isMarkFresh(symbol);
       const fresh = bookFresh && markFresh;
-      if (lastFresh.get(symbol) === fresh) continue;
-      lastFresh.set(symbol, fresh);
+      // LIVE / DELAYED / PAUSED: announced the moment it changes, even when no ticks arrive
+      const feedStatus = priceFeed.feedStatus(symbol);
+      if (lastStatus.get(symbol) === feedStatus) continue;
+      lastStatus.set(symbol, feedStatus);
       for (const [client, state] of clients) {
         if (wants(state, 'price', symbol) || (state.book && wants(state, 'book', symbol))) {
-          send(client, { type: 'feed', symbol, fresh, bookFresh, markFresh });
+          send(client, { type: 'feed', symbol, fresh, bookFresh, markFresh, feedStatus });
         }
       }
     }

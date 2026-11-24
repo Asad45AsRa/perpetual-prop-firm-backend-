@@ -2,7 +2,7 @@ import Decimal from 'decimal.js';
 
 // =====================================================================
 // Pure trading math. No database, no network, no clock.
-// Everything here is deterministic and unit tested (tests/ folder).
+// Everything here is deterministic. Fills are priced by the server mark (see matching.ts), never by a spread or slippage model.
 // Netting model: one position per account and market.
 // =====================================================================
 
@@ -32,33 +32,6 @@ export const tradingFee = (notionalValue: Decimal, feeRate: Decimal.Value): Deci
 export function unrealizedPnl(side: PositionSide, size: Decimal, entry: Decimal, mark: Decimal): Decimal {
   const priceDiff = side === 'LONG' ? mark.minus(entry) : entry.minus(mark);
   return priceDiff.mul(size);
-}
-
-export interface FillPriceInput {
-  side: Side;
-  mid: Decimal;
-  bid: Decimal | null;
-  ask: Decimal | null;
-  // Used only when no bid/ask is available (full spread in basis points)
-  spreadBps: Decimal.Value;
-  slippageBps: Decimal.Value;
-  pricePrecision: number;
-}
-
-// Documented virtual execution model for MARKET orders:
-//   BUY  fills at best ask (or mid + half spread) plus slippage
-//   SELL fills at best bid (or mid - half spread) minus slippage
-// Buys round up and sells round down, so rounding never favours the trader.
-export function marketFillPrice(input: FillPriceInput): Decimal {
-  const slip = new Decimal(input.slippageBps).div(10_000);
-  const halfSpread = new Decimal(input.spreadBps).div(2).div(10_000);
-
-  if (input.side === 'BUY') {
-    const base = input.ask ?? input.mid.mul(new Decimal(1).plus(halfSpread));
-    return base.mul(new Decimal(1).plus(slip)).toDecimalPlaces(input.pricePrecision, Decimal.ROUND_UP);
-  }
-  const base = input.bid ?? input.mid.mul(new Decimal(1).minus(halfSpread));
-  return base.mul(new Decimal(1).minus(slip)).toDecimalPlaces(input.pricePrecision, Decimal.ROUND_DOWN);
 }
 
 export interface FillResult {
@@ -146,9 +119,7 @@ export function isLiquidated(side: PositionSide, mark: Decimal, liqPrice: Decima
 // opening fills, so adding with another leverage never re-margins the old part.
 export const initialMargin = (notionalValue: Decimal, leverage: number): Decimal => notionalValue.div(leverage);
 
-// Maintenance margin is a REFERENCE value only (default 50 percent of the initial margin).
-// It never triggers a liquidation by itself: accounts are closed by the daily / drawdown floors.
-export const maintenanceMarginRef = (im: Decimal, fraction: Decimal.Value = '0.5'): Decimal => im.mul(fraction);
+// Maintenance margin (spec section 8) lives in market-policy.ts: |qty| x mark x (0.5 / symbol max leverage).
 
 // When a position shrinks, its margin shrinks in the same proportion.
 export function scaleMarginOnReduce(oldMargin: Decimal, oldSize: Decimal, newSize: Decimal): Decimal {

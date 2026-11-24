@@ -8,11 +8,29 @@
 openapi: 3.0.3
 info:
   title: Perpetual Prop Firm API - Auth, RBAC, Markets & Trading
-  version: 2.2.0
+  version: 2.3.0
   description: |
     **Scope now: authentication, RBAC, Hyperliquid market data, the trading engine and admin market management.**
     Payments, payouts, affiliate and the other admin feature endpoints are still left out of this file (kept commented
     at the bottom) and will be documented when they are wired.
+
+    ### What is new in 2.3.0 (trading engine aligned with the Terminal Implementation Specification v1.0)
+    - **The server mark price is the only execution price.** Market orders fill in full at the fresh mark (zero slippage, taker).
+      A marketable limit fills at the mark, never worse than the limit (taker). A resting limit fills in full at its exact limit price
+      (maker) when a mark that arrived AFTER the order was accepted crosses it. Stops / TP / SL are triggered by the mark only and fill at
+      the saved trigger price (the first fresh mark after a data outage). The order book is used only for marketability and the liquidity guard.
+    - **No partial entry fills, no slippage settings.** `maxSlippagePct` and `timeInForce` were removed; limit orders take `expiry`
+      (`GTC`, `5m`, `1h`, `24h`, `30d`). IOC / FOK are not available. Reduce-only and exit orders are capped to the open position.
+    - **Freshness:** feed status `LIVE` / `DELAYED` (mark older than 2 s, warning) / `PAUSED` (older than 5 s, trading blocked). New entries also pause
+      when the book mid and the mark disagree by more than 0.75 % (BTC, ETH, SOL) or 1.5 % (other symbols).
+    - **Margin:** new-entry capacity = `max(0, min(balance, equity) - used margin - pending margin)` (floating gains do not increase it).
+      Maintenance margin = `|qty| x mark x 0.5 / symbol max leverage`; a healthy account whose equity falls to it is force-closed without a penalty.
+      The gross exposure cap is a plan setting (10x equity, Instant 3x) measured on current equity.
+    - **Limits:** liquidity guard (an opening entry may use at most 10 % of the 30 s median visible depth within 1 % of the mark), minimum residual after a partial
+      close, 5 exposure-increasing requests per second and 120 per minute per account, one net position per symbol (hedge mode refused).
+    - **Funding is disabled** (reference rate only, nothing is charged). Fees are rounded up to 6 decimals.
+    - **New:** `POST /trading/accounts/{accountId}/orders/preview` (ticket preview with the maximum valid notional and the first binding rule) and the per-second
+      account stream `ws://host/ws/account`.
 
     ### What is new in 2.2.0 (Terminal market data)
     - **New public routes under `/api/v1/terminal`** for the trading terminal: `bootstrap`, `markets`, `markets/{symbol}`,
@@ -86,12 +104,12 @@ info:
     - `429` `RATE_LIMITED` / `RESEND_COOLDOWN` (`details.retryInSeconds`) / `TOO_MANY_ATTEMPTS`.
 
     ### Trading errors (HTTP 422, same `{ code, message, requestId, details? }` shape)
-    `MARKET_FEED_STALE`, `MARKET_DISABLED`, `MARKET_CLOSE_ONLY`, `TRADING_PAUSED`, `ACCOUNT_NOT_ACTIVE`, `INVALID_ORDER`, `INVALID_LOT`,
-    `INVALID_TICK`, `BELOW_MIN_NOTIONAL`, `LEVERAGE_CAP`, `INVALID_SLIPPAGE`, `VISIBLE_BOOK_TOO_THIN`, `OPEN_SLIPPAGE_EXCEEDED`,
-    `POST_ONLY_WOULD_TAKE`, `TRIGGER_WOULD_FIRE`, `POSITION_SIDE_REQUIRED`, `INVALID_POSITION_SIDE`, `NO_POSITION`, `REDUCE_ONLY`,
-    `REDUCE_ONLY_EXCESS`, `EXIT_LEG_LIMIT`, `EXIT_SIZE_EXCEEDS_POSITION`, `OPEN_ORDER_LIMIT`, `OPEN_POSITION_LIMIT`, `POSITION_CAP`,
-    `GROSS_EXPOSURE_CAP`, `INSUFFICIENT_MARGIN`, `POSITION_MODE_LOCKED`, `ORDER_ALREADY_FILLED`, `ORDER_NOT_ACTIVE`, and `NO_PRICE`
-    (no price/book received yet for a market).
+    `MARKET_FEED_STALE`, `MARKET_PRICE_DIVERGENCE`, `MARKET_DISABLED`, `MARKET_CLOSE_ONLY`, `TRADING_PAUSED`, `ACCOUNT_NOT_ACTIVE`, `INVALID_ORDER`, `INVALID_LOT`,
+    `INVALID_TICK`, `BELOW_MIN_NOTIONAL`, `LEVERAGE_CAP`, `LIQUIDITY_GUARD`, `LIQUIDITY_UNAVAILABLE`, `POST_ONLY_WOULD_TAKE`, `TRIGGER_WOULD_FIRE`,
+    `POSITION_SIDE_REQUIRED`, `INVALID_POSITION_SIDE`, `NO_POSITION`, `REDUCE_ONLY`, `RESIDUAL_BELOW_MIN`, `EXIT_LEG_LIMIT`, `EXIT_SIZE_EXCEEDS_POSITION`,
+    `OPEN_ORDER_LIMIT`, `OPEN_POSITION_LIMIT`, `POSITION_CAP`, `GROSS_EXPOSURE_CAP`, `INSUFFICIENT_MARGIN`, `POSITION_MODE_LOCKED`, `HEDGE_NOT_AVAILABLE`,
+    `ORDER_ALREADY_FILLED`, `ORDER_NOT_ACTIVE`, and `NO_PRICE` (no price/book received yet for a market).
+    `ORDER_RATE_LIMIT` is returned with HTTP **429** (more than 5 exposure-increasing orders per second or 120 per minute for one account).
 
     ## Market data WebSocket
     `ws://host/ws/market` (no cookie needed, public data). Updates are coalesced per symbol (`WS_PUSH_INTERVAL_MS`, default 250 ms).
@@ -99,12 +117,12 @@ info:
     - Server to client:
       - `hello` `{symbols, intervalMs, channels, candleIntervals}`
       - `price` `{symbol, price, bid, ask, mark, oracle, fundingRate, bookFresh, markFresh, fresh, ts, prevDayPx, change24h, change24hPct,
-        volume24hUsd, openInterest, openInterestUsd, premium, nextFundingAt}`
+        volume24hUsd, openInterest, openInterestUsd, premium, nextFundingAt, feedStatus, divergencePct}`
       - `book` `{symbol, bids, asks, seq, ts, depth, group}` (full snapshot, only if subscribed; rows are `[price, size]`)
       - `trades` `{symbol, snapshot, trades:[{price, size, side, time, tid}]}` newest first. `snapshot: true` is the recent history
         sent right after subscribing, later messages contain new trades only.
       - `candle` `{symbol, interval, t, T, o, h, l, c, v, n}`. The same `t` updates the forming candle, a new `t` is a new candle.
-      - `feed` `{symbol, fresh, bookFresh, markFresh}` (sent only when freshness changes)
+      - `feed` `{symbol, fresh, bookFresh, markFresh, feedStatus}` (sent only when the feed status changes: `LIVE`, `DELAYED`, `PAUSED`)
       - `error` `{code}` with `INVALID_JSON`, `SYMBOL_REQUIRED`, `INVALID_INTERVAL`, `UNKNOWN_SYMBOL`, `TOO_MANY_CANDLE_STREAMS`
         (max 6 candle streams per connection)
       - `pong`
@@ -118,6 +136,18 @@ info:
     - The symbol list of a message applies only to the channels named in that message (to `price`, `book` and `trades` when no channel
       is named). A terminal therefore keeps `price` for every market (markets table) and asks `book` + `trades` for the selected market only.
     - Live candle streams are opened on Hyperliquid only while a browser needs them and are released when the socket closes.
+
+    ## Account WebSocket (trading terminal)
+    `ws://host/ws/account` uses the customer session cookie (portal `TRADER`) and only streams accounts of the signed-in user.
+    - Client to server: `{"op":"subscribe","accountId":"<uuid>"}` (a new subscribe replaces the previous account and starts from a fresh server snapshot),
+      `{"op":"unsubscribe"}`, `{"op":"ping"}`.
+    - Server to client:
+      - `account` `{accountId, ts, account, feed}` **every second**. `account` has the shape of `AccountOverview` (balance, equity, open PnL, margin capacity,
+        exposure, every position with its live mark price and PnL). `feed` is `{SYMBOL: {status, markAgeMs}}`. Computed from the stored account state and the live
+        Hyperliquid marks, without a database read.
+      - `orders` `{accountId, orders}` working orders, after every order / fill / cancel / expiry.
+      - `fills` `{accountId, fills}` the latest 50 fills (de-duplicate by `id`).
+      - `error` `{code}` with `ACCOUNT_REQUIRED`, `ACCOUNT_NOT_FOUND`, `INVALID_JSON`; `pong`.
 
     ## Guards
     Each operation shows its guard in `x-rbac`: `public`, `customer`, `staff`, `super_admin`,
@@ -444,10 +474,11 @@ components:
     PositionMode:
       type: string
       enum: [ONE_WAY, HEDGE]
-      description: ONE_WAY = one net position per market. HEDGE = independent long and short per market (`positionSide` required).
+      description: 'ONE_WAY = one net position per market (the only mode in v1). HEDGE exists only for old accounts and cannot be selected (HEDGE_NOT_AVAILABLE).'
     OrderType: { type: string, enum: [MARKET, LIMIT, STOP_MARKET, TAKE_PROFIT, STOP_LOSS] }
     OrderStatus: { type: string, enum: [NEW, PARTIALLY_FILLED, FILLED, CANCELED, REJECTED] }
-    TimeInForce: { type: string, enum: [GTC, IOC] }
+    TimeInForce: { type: string, enum: [GTC, IOC], description: 'Always GTC in v1 (IOC is not enabled). Use `expiry` for limit orders.' }
+    Expiry: { type: string, enum: [GTC, 5m, 1h, 24h, 30d], description: 'Limit orders only. The server cancels the order at expiry and releases its margin.' }
     Liquidity: { type: string, enum: [MAKER, TAKER] }
     LedgerType: { type: string, enum: [DEPOSIT, REALIZED_PNL, FEE, FUNDING, PAYOUT, ADJUSTMENT] }
     Market:
@@ -547,6 +578,7 @@ components:
             openInterest: { type: string, nullable: true, description: In base asset units. }
             openInterestUsd: { type: string, nullable: true }
             premium: { type: string, nullable: true }
+            feedStatus: { type: string, enum: [LIVE, DELAYED, PAUSED], description: 'DELAYED = mark older than 2 s (warning), PAUSED = older than 5 s (trading blocked).' }
             nextFundingAt: { type: integer, description: 'Next full UTC hour (Hyperliquid pays funding hourly), Unix ms.' }
     TerminalBook:
       type: object
@@ -608,10 +640,10 @@ components:
       description: |
         | type | needs |
         |---|---|
-        | `MARKET` (default) | `size`. Opening/adding/reversing needs the FULL size within the visible book and within `maxSlippagePct` (default 3 %). Closing orders may fill partly and have no slippage cap. |
-        | `LIMIT` | `size`, `limitPrice`. Crossing fills as taker (never above the limit), the rest rests (`GTC`) or is cancelled (`IOC`). Resting fills are maker at the limit price. `postOnly` rejects instead of taking. |
-        | `STOP_MARKET` | `size`, `triggerPrice`. Entry stop, reserves nothing; margin and caps are re-checked when it fires. |
-        | `TAKE_PROFIT` / `STOP_LOSS` | `triggerPrice` + `size` or `closePosition: true`. Reduce-only. Fires when the mark OR the executable side of the book touches the level. |
+        | `MARKET` (default) | `size`. Fills in FULL at the fresh server mark, zero slippage, taker fee. An opening order must also pass the liquidity guard. |
+        | `LIMIT` | `size`, `limitPrice`. Marketable at acceptance (crosses the best opposite price OR the mark) = taker fill at the fresh mark, never worse than the limit. Otherwise it rests and fills in full at its exact limit price (maker) when a LATER fresh mark crosses it. `postOnly` rejects a marketable order. Optional `expiry`. |
+        | `STOP_MARKET` | `size`, `triggerPrice`. Entry stop, reserves nothing; margin and caps are re-checked when the mark touches the trigger. |
+        | `TAKE_PROFIT` / `STOP_LOSS` | `triggerPrice` + `size` or `closePosition: true`. Reduce-only, triggered by the mark only. Fills at the trigger price (the first fresh mark after a data outage). |
       properties:
         symbol: { type: string, minLength: 1, maxLength: 20, example: BTC }
         side: { $ref: '#/components/schemas/OrderSide' }
@@ -620,12 +652,11 @@ components:
         closePosition: { type: boolean, default: false, description: 'TP / SL that always closes the whole position (size follows the position).' }
         limitPrice: { $ref: '#/components/schemas/Decimal' }
         triggerPrice: { $ref: '#/components/schemas/Decimal' }
-        leverage: { type: integer, minimum: 1, maximum: 200, default: 1, description: 'Per order. Effective max = min(market, plan).' }
-        reduceOnly: { type: boolean, default: false }
+        leverage: { type: integer, minimum: 1, maximum: 200, default: 1, description: 'Per order. Effective max = min(market, plan). Terminals should default to min(3, maximum).' }
+        reduceOnly: { type: boolean, default: false, description: 'Capped to the open quantity, never reverses a position.' }
         postOnly: { type: boolean, default: false }
-        timeInForce: { allOf: [{ $ref: '#/components/schemas/TimeInForce' }], default: GTC }
+        expiry: { allOf: [{ $ref: '#/components/schemas/Expiry' }], default: GTC }
         positionSide: { $ref: '#/components/schemas/PositionSide' }
-        maxSlippagePct: { $ref: '#/components/schemas/Decimal' }
         clientOrderId: { type: string, minLength: 1, maxLength: 64, description: 'Same as the `Idempotency-Key` header.' }
     ModifyOrderRequest:
       type: object
@@ -653,10 +684,11 @@ components:
         timeInForce: { $ref: '#/components/schemas/TimeInForce' }
         positionSide: { type: string, nullable: true, allOf: [{ $ref: '#/components/schemas/PositionSide' }] }
         closePosition: { type: boolean }
-        maxSlippagePct: { type: string, nullable: true }
+        maxSlippagePct: { type: string, nullable: true, description: 'Always null (there is no slippage model, fills use the mark price).' }
+        expiresAt: { type: string, format: date-time, nullable: true, description: 'Resting limit orders with an expiry.' }
         reservedMargin: { type: string, description: Margin + fee buffer held for the unfilled part of a resting opening order. }
         triggeredAt: { type: string, format: date-time, nullable: true }
-        cancelReason: { type: string, nullable: true, example: USER_CANCEL_ALL }
+        cancelReason: { type: string, nullable: true, example: USER_CANCEL_ALL, description: 'For example USER, USER_CANCEL_ALL, EXPIRED, POSITION_CLOSED, REPLACED_BY:<id>, RISK_MAINTENANCE_MARGIN.' }
         clientOrderId: { type: string, nullable: true }
         createdAt: { type: string, format: date-time }
     Fill:
@@ -709,12 +741,13 @@ components:
         notional: { type: string }
         leverage: { type: integer }
         margin: { type: string, description: 'Initial margin (notional / leverage per opening fill).' }
-        maintenanceMarginRef: { type: string, description: 'Reference only (IM / 2), never liquidates.' }
+        maintenanceMargin: { type: string, description: '|size| x mark x 0.5 / symbol max leverage.' }
+        maintenanceMarginRef: { type: string, description: Same value as maintenanceMargin (older name). }
         unrealizedPnl: { type: string }
         liquidationPrice: { type: string, nullable: true, description: 'Always null (cross margin, no per-position liquidation price).' }
     AccountOverview:
       type: object
-      description: 'Cross margin. `equity = balance + unrealizedPnl`; `availableMargin = equity - marginUsed - reservedMargin`.'
+      description: 'Cross margin. `equity = balance + unrealizedPnl`; `availableMargin` is the NEW-ENTRY capacity `max(0, min(balance, equity) - marginUsed - reservedMargin)` (floating gains do not increase it). Streamed every second on /ws/account.'
       properties:
         id: { type: string, format: uuid }
         stage: { type: string, enum: [CHALLENGE, FUNDED] }
@@ -726,13 +759,73 @@ components:
         equity: { type: string }
         marginUsed: { type: string }
         reservedMargin: { type: string, description: Margin reserved by working orders. }
-        freeMargin: { type: string }
-        availableMargin: { type: string }
-        maintenanceMarginRef: { type: string }
+        freeMargin: { type: string, description: 'Classic free margin: equity - marginUsed - reservedMargin (display only).' }
+        availableMargin: { type: string, description: 'New-entry margin capacity.' }
+        maintenanceMargin: { type: string, description: Total maintenance threshold of all positions. }
+        maintenanceMarginRef: { type: string, description: Same value as maintenanceMargin (older name). }
         grossExposure: { type: string }
-        grossExposureLimit: { type: string, description: 'grossExposureMultiple (default 10) x equity.' }
+        grossExposureLimit: { type: string, description: 'grossExposureMultiple x current equity.' }
+        grossExposureMultiple: { type: integer, description: '10 for evaluation / funded models, 3 for Instant.' }
         overCap: { type: boolean, description: 'Above the cap: new exposure is blocked, reducing is allowed (GROSS_EXPOSURE_CAP).' }
         positions: { type: array, items: { $ref: '#/components/schemas/PositionView' } }
+    OrderPreviewRequest:
+      type: object
+      required: [symbol, side]
+      description: Send exactly ONE of `size` (coins), `notionalUsd` (value) or `marginUsd` (value = margin x leverage).
+      properties:
+        symbol: { type: string, example: BTC }
+        side: { $ref: '#/components/schemas/OrderSide' }
+        type: { type: string, enum: [MARKET, LIMIT, STOP_MARKET], default: MARKET }
+        size: { $ref: '#/components/schemas/Decimal' }
+        notionalUsd: { $ref: '#/components/schemas/Decimal' }
+        marginUsd: { $ref: '#/components/schemas/Decimal' }
+        leverage: { type: integer, minimum: 1, maximum: 200, default: 1 }
+        limitPrice: { $ref: '#/components/schemas/Decimal' }
+        triggerPrice: { $ref: '#/components/schemas/Decimal' }
+        reduceOnly: { type: boolean, default: false }
+        postOnly: { type: boolean, default: false }
+    OrderPreview:
+      type: object
+      description: Read-only calculation on the live mark and the account state. Nothing is reserved or written.
+      properties:
+        symbol: { type: string }
+        side: { $ref: '#/components/schemas/OrderSide' }
+        type: { $ref: '#/components/schemas/OrderType' }
+        status: { type: string, enum: [READY, BLOCKED] }
+        feedStatus: { type: string, enum: [LIVE, DELAYED, PAUSED] }
+        markPrice: { type: string }
+        referencePrice: { type: string, description: 'Price used for the estimate: mark, limit price or trigger price.' }
+        liquidity: { $ref: '#/components/schemas/Liquidity' }
+        size: { type: string }
+        notionalUsd: { type: string }
+        openNotionalUsd: { type: string, description: The part that opens or adds exposure. }
+        closeNotionalUsd: { type: string, description: The part that reduces a position. }
+        leverage: { type: integer }
+        maxLeverage: { type: integer }
+        initialMargin: { type: string }
+        pendingMargin: { type: string, description: Margin reserved while a resting order waits. }
+        feeRate: { type: string }
+        estimatedFee: { type: string }
+        balanceAfterFee: { type: string }
+        marginCapacity: { type: string, description: New-entry capacity before this order. }
+        grossExposure: { type: string }
+        grossExposureLimit: { type: string }
+        maxNotionalUsd: { type: string, nullable: true, description: Largest valid notional of a new entry right now. }
+        binding:
+          type: object
+          nullable: true
+          description: The FIRST binding limit (the rule that sets maxNotionalUsd).
+          properties:
+            code: { type: string, example: INSUFFICIENT_MARGIN }
+            message: { type: string }
+        rejection:
+          type: object
+          nullable: true
+          description: The rule that would reject THIS order (the same rules and codes as placing it).
+          properties:
+            code: { type: string }
+            message: { type: string }
+        note: { type: string }
     ClosePositionRequest:
       type: object
       properties:
@@ -1498,6 +1591,31 @@ paths:
         '401': { $ref: '#/components/responses/Unauthorized' }
         '403': { $ref: '#/components/responses/Forbidden' }
         '404': { $ref: '#/components/responses/NotFound' }
+  /api/v1/trading/accounts/{accountId}/orders/preview:
+    post:
+      tags: [Trading]
+      summary: Order ticket preview (size, notional, margin, fee, maker / taker, maximum valid size)
+      description: |
+        Read-only. Returns what the engine would decide for this order right now, including the FIRST binding limit (`binding`) and the largest valid
+        notional (`maxNotionalUsd`). Nothing is reserved, filled or written. Uses the live mark and the live account state.
+      security: [{ customerCookie: [] }]
+      x-rbac: portal:TRADER + ownership
+      parameters: [{ $ref: '#/components/parameters/AccountIdParam' }]
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema: { $ref: '#/components/schemas/OrderPreviewRequest' }
+            examples:
+              byValue: { value: { symbol: BTC, side: BUY, type: MARKET, notionalUsd: '10000', leverage: 10 } }
+              byMargin: { value: { symbol: ETH, side: SELL, type: LIMIT, marginUsd: '500', leverage: 5, limitPrice: '3200.5' } }
+      responses:
+        '200': { description: Preview, content: { application/json: { schema: { $ref: '#/components/schemas/OrderPreview' } } } }
+        '400': { $ref: '#/components/responses/BadRequest' }
+        '401': { $ref: '#/components/responses/Unauthorized' }
+        '403': { $ref: '#/components/responses/Forbidden' }
+        '404': { $ref: '#/components/responses/NotFound' }
+        '422': { $ref: '#/components/responses/Unprocessable' }
   /api/v1/trading/accounts/{accountId}/orders:
     parameters: [{ $ref: '#/components/parameters/AccountIdParam' }]
     post:
@@ -1506,9 +1624,11 @@ paths:
       description: |
         Idempotent: send the `Idempotency-Key` header (max 64 chars) or `clientOrderId` in the body. A replay returns HTTP 200
         with `duplicate: true`; a new order returns 201. Limited to 30 writes per second per user.
-        Fills are posted through the ledger (`REALIZED_PNL`, `FEE`) and risk rules are re-checked right after a trade.
-        Limits (editable in the `trading` setting): 50 open orders, 20 open position legs, 10 exit orders per position,
-        gross exposure <= 10x equity for new exposure.
+        Execution follows the spec: the server mark is the fill price (see PlaceOrderRequest). Fills are posted through the ledger (`REALIZED_PNL`, `FEE`)
+        and risk rules are re-checked right after a trade.
+        Limits: 50 pending opening orders, 20 open positions (one net position per symbol), 10 exit orders per position, minimum order value and lot / tick grid,
+        gross exposure <= plan multiple x current equity (10x, Instant 3x), single opening entry <= 10 % of the median visible depth (`LIQUIDITY_GUARD`),
+        at most 5 exposure-increasing requests per second and 120 per minute per account (HTTP 429 `ORDER_RATE_LIMIT`, reduce-only exits are exempt).
       security: [{ customerCookie: [] }]
       x-rbac: portal:TRADER + ownership
       parameters:
@@ -1519,8 +1639,8 @@ paths:
           application/json:
             schema: { $ref: '#/components/schemas/PlaceOrderRequest' }
             examples:
-              market: { value: { symbol: BTC, side: BUY, type: MARKET, size: '0.01', leverage: 5, maxSlippagePct: '1' } }
-              limit: { value: { symbol: ETH, side: SELL, type: LIMIT, size: '0.5', limitPrice: '3200.5', timeInForce: GTC, postOnly: true } }
+              market: { value: { symbol: BTC, side: BUY, type: MARKET, size: '0.01', leverage: 3 } }
+              limit: { value: { symbol: ETH, side: SELL, type: LIMIT, size: '0.5', limitPrice: '3200.5', expiry: 1h, postOnly: true } }
               stopLoss: { value: { symbol: BTC, side: SELL, type: STOP_LOSS, triggerPrice: '60000', closePosition: true } }
       responses:
         '200': { description: Duplicate request (already processed), content: { application/json: { schema: { $ref: '#/components/schemas/PlaceOrderResult' } } } }
@@ -1614,8 +1734,8 @@ paths:
       tags: [Trading]
       summary: Close a position (whole, or `size` for a partial close)
       description: |
-        Reduce-only market order at the live book. A thin book gives a partial fill and the rest stays open.
-        In hedge mode with both legs open, `positionSide` is required (`POSITION_SIDE_REQUIRED`).
+        Reduce-only market order at the fresh server mark (taker fee, no slippage). A partial close that would leave less than the minimum order value is
+        rejected (`RESIDUAL_BELOW_MIN`): close the whole position instead.
       security: [{ customerCookie: [] }]
       x-rbac: portal:TRADER + ownership
       parameters:
@@ -1654,8 +1774,8 @@ paths:
   /api/v1/trading/accounts/{accountId}/position-mode:
     put:
       tags: [Trading]
-      summary: Switch ONE_WAY / HEDGE
-      description: Only while the account has no open positions and no working orders (`POSITION_MODE_LOCKED` otherwise).
+      summary: Set the position mode (ONE_WAY only)
+      description: Spec v1 has one net position per symbol. `ONE_WAY` is accepted, `HEDGE` is refused with `HEDGE_NOT_AVAILABLE`.
       security: [{ customerCookie: [] }]
       x-rbac: portal:TRADER + ownership
       parameters: [{ $ref: '#/components/parameters/AccountIdParam' }]

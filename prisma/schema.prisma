@@ -1,4 +1,10 @@
 // =====================================================================
+// FILE:   backend/prisma/schema.prisma
+// FOLDER: backend/prisma/
+// ACTION: REPLACE the existing file (complete file).
+// Schema change only. No data is created, no mock or placeholder rows.
+// =====================================================================
+// =====================================================================
 // Perpetual Prop Firm - database schema (PostgreSQL)
 // Rules:
 //  * All money / price / size values are Decimal, never Float.
@@ -304,6 +310,8 @@ model Plan {
   dailyLossPct     Decimal         @db.Decimal(10, 4)
   maxDrawdownPct   Decimal         @db.Decimal(10, 4)
   maxLeverage      Int             @default(20)
+  // Account-wide gross exposure cap as a multiple of CURRENT equity (spec: 10 for evaluation / funded models, 3 for Instant)
+  grossExposureMultiple Int        @default(10)
   minTradingDays   Int             @default(0)
   // Calculation methods must be confirmed with the client
   dailyLossMethod  DailyLossMethod @default(BALANCE_BASED)
@@ -461,6 +469,8 @@ model Order {
   // Margin + fee buffer held for the unfilled part of a resting opening order
   reservedMargin Decimal    @default(0) @db.Decimal(20, 8)
   cancelReason  String?
+  // Resting limit orders only: the server cancels the order at this time (expiry GTC / 5m / 1h / 24h / 30d)
+  expiresAt     DateTime?
   createdAt     DateTime    @default(now())
   updatedAt     DateTime    @updatedAt
 
@@ -470,6 +480,7 @@ model Order {
   @@index([accountId, createdAt])
   @@index([marketId, status])
   @@index([accountId, status])
+  @@index([status, expiresAt])
 }
 
 model Fill {

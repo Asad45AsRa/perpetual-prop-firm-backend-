@@ -1,12 +1,15 @@
 import Decimal from 'decimal.js';
 import type { PositionSide } from './calculations';
-import { maintenanceMarginRef, unrealizedPnl } from './calculations';
+import { unrealizedPnl } from './calculations';
+import { maintenanceMargin } from './market-policy';
 
 // =====================================================================
 // Pure account metrics and pre-trade exposure checks (cross margin).
-//   Equity           = balance + floating PnL (at mark price)
-//   Available margin = equity - initial margin of open positions - margin reserved by resting orders
-//   Gross exposure   = sum of |size| x mark over ALL open legs (+ worst case of resting opening orders)
+//   Equity              = balance + floating PnL (at mark price)
+//   New-entry capacity  = max(0, min(balance, equity) - used margin - pending margin)
+//                         (floating losses reduce it, floating GAINS never increase it)
+//   Maintenance margin  = sum of |size| x mark x (0.5 / symbol max leverage) over all open legs
+//   Gross exposure      = sum of |size| x mark over ALL open legs (+ worst case of resting opening orders)
 // =====================================================================
 
 export interface Leg {
@@ -17,6 +20,8 @@ export interface Leg {
   mark: Decimal;
   // Initial margin held by this leg
   margin: Decimal;
+  // Maximum leverage the symbol permits (maintenance margin does not use the leverage the trader selected)
+  maxLeverage: number;
 }
 
 // An opening order that is still working (resting limit). Stops reserve nothing until they trigger.
@@ -35,8 +40,14 @@ export interface AccountMetrics {
   unrealizedPnl: Decimal;
   equity: Decimal;
   initialMargin: Decimal;
-  maintenanceMarginRef: Decimal;
+  // Total maintenance threshold of the account (forced close when equity falls to it)
+  maintenanceMargin: Decimal;
   reservedMargin: Decimal;
+  // Classic free margin: equity - initial margin - reserved (can include floating gains, display only)
+  freeMargin: Decimal;
+  // New-entry margin capacity before clamping (negative = the order cannot be funded)
+  marginCapacityRaw: Decimal;
+  // New-entry margin capacity shown to the trader: max(0, marginCapacityRaw)
   availableMargin: Decimal;
   // Open legs only
   grossExposure: Decimal;
@@ -46,27 +57,26 @@ export interface AccountMetrics {
 
 const sum = (values: Decimal[]) => values.reduce((a, b) => a.plus(b), new Decimal(0));
 
-export function computeMetrics(
-  balance: Decimal,
-  legs: Leg[],
-  working: WorkingExposure[] = [],
-  mmrFraction: Decimal.Value = '0.5',
-): AccountMetrics {
+export function computeMetrics(balance: Decimal, legs: Leg[], working: WorkingExposure[] = []): AccountMetrics {
   const upl = sum(legs.map((l) => unrealizedPnl(l.side, l.size, l.entryPrice, l.mark)));
   const im = sum(legs.map((l) => l.margin));
   const reserved = sum(working.map((w) => w.reserved));
   const equity = balance.plus(upl);
   const gross = sum(legs.map((l) => l.size.mul(l.mark)));
   const grossOrders = sum(working.map((w) => w.remaining.mul(w.price)));
+  const maintenance = sum(legs.map((l) => maintenanceMargin(l.size.mul(l.mark), l.maxLeverage)));
+  const capacityRaw = Decimal.min(balance, equity).minus(im).minus(reserved);
 
   return {
     balance,
     unrealizedPnl: upl,
     equity,
     initialMargin: im,
-    maintenanceMarginRef: maintenanceMarginRef(im, mmrFraction),
+    maintenanceMargin: maintenance,
     reservedMargin: reserved,
-    availableMargin: equity.minus(im).minus(reserved),
+    freeMargin: equity.minus(im).minus(reserved),
+    marginCapacityRaw: capacityRaw,
+    availableMargin: Decimal.max(0, capacityRaw),
     grossExposure: gross,
     grossWithOrders: gross.plus(grossOrders),
   };
@@ -84,7 +94,7 @@ export type ExposureRejection = 'POSITION_CAP' | 'GROSS_EXPOSURE_CAP' | 'INSUFFI
 export interface ExposureCheckInput {
   before: AccountMetrics;
   after: AccountMetrics;
-  // Platform rule: gross exposure after the trade must stay within this multiple of equity
+  // Platform rule: gross exposure after the trade must stay within this multiple of the current equity
   grossMultiple: Decimal.Value;
   // Open notional of the market + side after the trade, and its approved cap (null = no cap)
   symbolSideNotionalAfter: Decimal;
@@ -100,12 +110,13 @@ export function checkNewExposure(input: ExposureCheckInput): ExposureRejection |
 
   if (input.symbolSideCap != null && input.symbolSideNotionalAfter.gt(input.symbolSideCap)) return 'POSITION_CAP';
 
-  const cap = input.after.equity.mul(input.grossMultiple);
+  // Spec: the cap is a multiple of CURRENT equity, i.e. the equity before this order (and before its fee)
+  const cap = input.before.equity.mul(input.grossMultiple);
   if (input.after.grossWithOrders.gt(cap) && input.after.grossWithOrders.gt(input.before.grossWithOrders)) {
     return 'GROSS_EXPOSURE_CAP';
   }
 
-  if (input.after.availableMargin.lt(0)) return 'INSUFFICIENT_MARGIN';
+  if (input.after.marginCapacityRaw.lt(0)) return 'INSUFFICIENT_MARGIN';
   return null;
 }
 

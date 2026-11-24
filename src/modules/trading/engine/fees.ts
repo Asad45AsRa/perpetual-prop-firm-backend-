@@ -2,9 +2,9 @@ import Decimal from 'decimal.js';
 
 // =====================================================================
 // Fee schedule and fee math (pure).
-// Maker = a resting limit order that gets filled.
-// Taker = market, stop, take-profit, stop-loss, IOC and any limit order that
-//         crosses the book on placement.
+// Maker = a resting limit order that gets filled (at its saved limit price).
+// Taker = market, stop, take-profit, stop-loss, manual closes and any limit order that
+//         is marketable at acceptance (crosses the opposite best price or the mark).
 // Fees are charged on the notional of every fill, on entries AND exits,
 // also on losing trades.
 // =====================================================================
@@ -44,8 +44,8 @@ export function resolveFeeRate(input: FeeRateInput): Decimal {
   return new Decimal(input.liquidity === 'MAKER' ? rates.maker : rates.taker);
 }
 
-// Money in the ledger has 8 decimals. Fees are rounded UP so rounding never favours the trader.
-export const LEDGER_DECIMALS = 8;
+// Spec: ledger money is rounded once with 6 decimal (USDC settlement) precision. Fees are rounded UP so rounding never favours the trader.
+export const LEDGER_DECIMALS = 6;
 
 export function feeAmount(notional: Decimal, rate: Decimal.Value): Decimal {
   return notional.mul(rate).toDecimalPlaces(LEDGER_DECIMALS, Decimal.ROUND_UP);

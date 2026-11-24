@@ -23,6 +23,20 @@ export const MARKET_CATALOG: Record<string, CatalogEntry> = {
   BTC: { marketType: 'CRYPTO', maxLeverage: 10, maxNotionalUsd: 1_000_000 },
   ETH: { marketType: 'CRYPTO', maxLeverage: 10, maxNotionalUsd: 1_000_000 },
   SOL: { marketType: 'CRYPTO', maxLeverage: 10, maxNotionalUsd: 300_000 },
+  // Other launch-whitelist majors (spec section 5): 5x and 150,000 USD per symbol.
+  // They are only synced when the symbol is listed in LAUNCH_SYMBOLS (default: BTC, ETH).
+  HYPE: { marketType: 'CRYPTO', maxLeverage: 5, maxNotionalUsd: 150_000 },
+  XRP: { marketType: 'CRYPTO', maxLeverage: 5, maxNotionalUsd: 150_000 },
+  DOGE: { marketType: 'CRYPTO', maxLeverage: 5, maxNotionalUsd: 150_000 },
+  BNB: { marketType: 'CRYPTO', maxLeverage: 5, maxNotionalUsd: 150_000 },
+  ADA: { marketType: 'CRYPTO', maxLeverage: 5, maxNotionalUsd: 150_000 },
+  AVAX: { marketType: 'CRYPTO', maxLeverage: 5, maxNotionalUsd: 150_000 },
+  LINK: { marketType: 'CRYPTO', maxLeverage: 5, maxNotionalUsd: 150_000 },
+  LTC: { marketType: 'CRYPTO', maxLeverage: 5, maxNotionalUsd: 150_000 },
+  DOT: { marketType: 'CRYPTO', maxLeverage: 5, maxNotionalUsd: 150_000 },
+  BCH: { marketType: 'CRYPTO', maxLeverage: 5, maxNotionalUsd: 150_000 },
+  SUI: { marketType: 'CRYPTO', maxLeverage: 5, maxNotionalUsd: 150_000 },
+  TRX: { marketType: 'CRYPTO', maxLeverage: 5, maxNotionalUsd: 150_000 },
 };
 
 // Used for any symbol that has no reviewed catalog row.

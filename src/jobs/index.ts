@@ -1,5 +1,5 @@
 import cron from 'node-cron';
-import { env } from '../config/env';
+import { env, fundingEnabled } from '../config/env';
 import { logger } from '../config/logger';
 import { prisma } from '../config/prisma';
 import { toD, ZERO } from '../utils/decimal';
@@ -92,11 +92,16 @@ export function startJobs() {
   startOrderMatcher();
 
   const utc = { timezone: 'UTC' };
+  // Spec v1: periodic funding cash flow is disabled (FUNDING_ENABLED=false). The reference rate is only displayed.
+  if (fundingEnabled) {
+    tasks.push(
+      // Funding: snapshot of the open positions exactly on every UTC hour (6-field cron: second 0)
+      cron.schedule('0 0 * * * *', safe('funding-capture', async () => void (await captureFundingBoundary(hourStartOf(Date.now())))), utc),
+      // Post the funding of closed hours as soon as the official rate is published (retries until it is)
+      cron.schedule('20 * * * * *', safe('funding-apply', async () => void (await applyPendingFunding())), utc),
+    );
+  }
   tasks.push(
-    // Funding: snapshot of the open positions exactly on every UTC hour (6-field cron: second 0)
-    cron.schedule('0 0 * * * *', safe('funding-capture', async () => void (await captureFundingBoundary(hourStartOf(Date.now())))), utc),
-    // Post the funding of closed hours as soon as the official rate is published (retries until it is)
-    cron.schedule('20 * * * * *', safe('funding-apply', async () => void (await applyPendingFunding())), utc),
     cron.schedule(`0 ${env.DAILY_RESET_UTC_HOUR} * * *`, safe('daily-reset', runDailyReset), utc),
     cron.schedule('*/5 * * * *', safe('stale-payments', checkStalePayments), utc),
     cron.schedule('15 * * * *', safe('ledger-reconciliation', reconcileLedger), utc),

@@ -70,6 +70,8 @@ export function presentTerminalMarket(m: MarketRow, fees: Awaited<ReturnType<typ
     makerFeeRate: rate('MAKER'),
     takerFeeRate: rate('TAKER'),
     bookGroups: mid ? groupOptions(mid, new Decimal(m.priceTick.toString())) : [],
+    // LIVE / DELAYED / PAUSED (spec: delayed at 2 s, trading blocked at 5 s)
+    feedStatus: priceFeed.feedStatus(m.symbol),
     ...marketStats(m.symbol),
   };
 }

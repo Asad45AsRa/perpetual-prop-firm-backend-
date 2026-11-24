@@ -22,6 +22,7 @@ import { healthRoutes } from './modules/health/health.routes';
 import { marketRoutes } from './modules/markets/market.routes';
 import { marketWebSocket } from './modules/markets/market.ws';
 import { terminalRoutes } from './modules/markets/terminal.routes';
+import { accountWebSocket } from './modules/trading/account.ws';
 import { paymentRoutes } from './modules/payments/payments.routes';
 import { payoutRoutes } from './modules/payouts/payouts.routes';
 import { planRoutes } from './modules/plans/plans.routes';
@@ -95,6 +96,8 @@ export async function buildApp() {
 
   await app.register(healthRoutes);
   await app.register(marketWebSocket);
+  // Real-time account stream for the terminal (balance, equity, margin, positions, orders, fills)
+  await app.register(accountWebSocket);
 
   const api = { prefix: '/api/v1' };
   await app.register(async (v1) => {
@@ -116,5 +119,4 @@ export async function buildApp() {
 
   return app;
 }
-
 ///
