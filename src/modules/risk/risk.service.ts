@@ -15,6 +15,7 @@ import { executeMarketOrder } from '../trading/trading.service';
 import { latestBreachEvent } from './breach-review.service';
 import { computeFloors, evaluateRisk, isTargetSettled, latestResetBoundary, reviewDeadlineOf, tradingDateOf, type RiskInput, type RiskResult } from './risk-rules';
 
+
 // =====================================================================
 // Risk engine, challenge evaluation and automatic account restrictions.
 // Rules: Perpeye Trading Terminal v1.0 Complete Implementation Specification (23 Nov 2026), sections 8, 10 and 14.
@@ -39,14 +40,14 @@ class PassNotSettledError extends Error {
   }
 }
 
-interface ClosedFill {
+type ClosedFill = {
   symbol: string;
   side: string;
   size: string;
   price: string;
   fee: string;
   realizedPnl: string;
-}
+};
 
 type AccountWithPlan = Prisma.TradingAccountGetPayload<{ include: { plan: true } }>;
 
@@ -582,12 +583,12 @@ export async function getRiskStatus(accountId: string) {
     // Set after a daily / static breach: when, why, and until when a technical review can be requested
     breach: breachEvent
       ? {
-          eventId: breachEvent.id,
-          type: breachEvent.type,
-          at: breachEvent.createdAt.toISOString(),
-          reviewDeadline: reviewDeadlineOf(breachEvent.createdAt).toISOString(),
-          review: breachReview,
-        }
+        eventId: breachEvent.id,
+        type: breachEvent.type,
+        at: breachEvent.createdAt.toISOString(),
+        reviewDeadline: reviewDeadlineOf(breachEvent.createdAt).toISOString(),
+        review: breachReview,
+      }
       : null,
     // False while a mark of an open position is stale: the account is then not evaluated (no breach, no pass)
     feedHealthy: marksFresh(snapshot),
