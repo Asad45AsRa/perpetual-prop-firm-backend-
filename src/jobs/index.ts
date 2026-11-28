@@ -6,6 +6,7 @@ import { toD, ZERO } from '../utils/decimal';
 import { audit } from '../modules/audit/audit.service';
 import { syncPurchaseWithPlisio } from '../modules/payments/payments.service';
 import { applyPendingFunding, captureFundingBoundary, hourStartOf } from '../modules/markets/funding.service';
+import { runAbuseScan } from '../modules/risk/abuse.service';
 import { runDailyReset, runRiskMonitor } from '../modules/risk/risk.service';
 import { startOrderMatcher, stopOrderMatcher } from '../modules/trading/order-matcher';
 
@@ -101,9 +102,14 @@ export function startJobs() {
       cron.schedule('20 * * * * *', safe('funding-apply', async () => void (await applyPendingFunding())), utc),
     );
   }
+  // Catch-up: a reset that was missed while the server was down runs now (it skips accounts that already have today's reset)
+  void safe('daily-reset-catchup', () => runDailyReset())();
+
   tasks.push(
-    cron.schedule(`0 ${env.DAILY_RESET_UTC_HOUR} * * *`, safe('daily-reset', runDailyReset), utc),
+    cron.schedule(`0 ${env.DAILY_RESET_UTC_HOUR} * * *`, safe('daily-reset', () => runDailyReset()), utc),
     cron.schedule('*/5 * * * *', safe('stale-payments', checkStalePayments), utc),
+    // Hedging between accounts, copy trading and latency abuse: findings become flags for staff review
+    cron.schedule('2-57/5 * * * *', safe('abuse-scan', async () => void (await runAbuseScan())), utc),
     cron.schedule('15 * * * *', safe('ledger-reconciliation', reconcileLedger), utc),
     cron.schedule('30 0 * * *', safe('daily-report', dailyReport), utc),
     cron.schedule('0 3 * * *', safe('token-cleanup', cleanupTokens), utc),

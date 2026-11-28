@@ -7,6 +7,7 @@ import { Decimal, toD, ZERO } from '../../utils/decimal';
 import { emailTemplates, sendEmail } from '../../services/email.service';
 import { audit } from '../audit/audit.service';
 import { postLedgerEntry } from '../ledger/ledger.service';
+import { rebaseDailyFloorForPayout } from '../risk/risk.service';
 import { getSetting } from '../settings/settings.service';
 
 // Profit the trader may still request = profit * split - open requests.
@@ -109,6 +110,9 @@ export async function approvePayout(id: string, adminId: string) {
       refId: id,
       idempotencyKey: `payout:${id}:debit`,
     });
+    // The balance just dropped by the payout: rebase the daily floor ONCE from the remaining balance (the payout is not a trading
+    // loss; the static floor is unchanged; a rejected payout never reaches this line, so there is no second rebase)
+    await rebaseDailyFloorForPayout(tx, payout.accountId, id);
     await audit({ actorId: adminId, action: 'payout.approved', entity: 'Payout', entityId: id }, tx);
   });
   await sendEmail({ to: payout.user.email, ...emailTemplates.payoutUpdate('APPROVED', payout.amount.toString()) });

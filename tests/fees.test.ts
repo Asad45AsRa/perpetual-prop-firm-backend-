@@ -30,10 +30,10 @@ describe('fee schedule', () => {
     expect(feeAmount(d('1.4').mul(91000), DEFAULT_FEE_SCHEDULE.CRYPTO.taker).toString()).toBe('50.96');
   });
 
-  it('rounds fees UP at 8 decimals and signed amounts toward minus infinity', () => {
-    expect(feeAmount(d('0.000000011'), '1').toFixed()).toBe('0.00000002');
-    expect(roundLedger(d('1.123456789')).toString()).toBe('1.12345678');
-    expect(roundLedger(d('-1.123456781')).toString()).toBe('-1.12345679');
+  it('rounds fees UP at 6 decimals (USDC settlement precision) and signed amounts toward minus infinity', () => {
+    expect(feeAmount(d('0.0000011'), '1').toFixed()).toBe('0.000002');
+    expect(roundLedger(d('1.1234569')).toString()).toBe('1.123456');
+    expect(roundLedger(d('-1.1234561')).toString()).toBe('-1.123457');
   });
 
   it('lets a market override the group rate', () => {

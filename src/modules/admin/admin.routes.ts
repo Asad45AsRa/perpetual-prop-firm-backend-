@@ -12,6 +12,8 @@ import * as payouts from '../payouts/payouts.service';
 import { lockAccount } from '../risk/risk.service';
 import { SETTING_DEFAULTS, getSetting, saveSetting, type SettingKey } from '../settings/settings.service';
 import { adminStaffRoutes } from './admin.staff.routes';
+import { updatePlanVersioned } from '../plans/plan-versioning';
+import { adminRiskRoutes } from '../risk/risk.admin.routes';
 import { adminRbacRoutes } from '../rbac/rbac.routes';
 
 const page = z.object({
@@ -40,6 +42,7 @@ export async function adminRoutes(app: FastifyInstance) {
 
   // Staff management (super admin only)
   await app.register(adminStaffRoutes, { prefix: '/staff' });
+  await app.register(adminRiskRoutes, { prefix: '/risk' });
   // Permission catalog + customer portal management
   await app.register(adminRbacRoutes, { prefix: '/rbac' });
 
@@ -100,9 +103,16 @@ export async function adminRoutes(app: FastifyInstance) {
 
   app.patch('/plans/:id', { preHandler: requireAccess('plans', 'manage') }, async (req) => {
     const { id } = parse(idParams, req.params);
-    const plan = await prisma.plan.update({ where: { id }, data: parse(planSchema.partial(), req.body) });
-    await audit({ actorId: req.user!.id, action: 'plan.updated', entity: 'Plan', entityId: id });
-    return plan;
+    // A rule change on a plan that accounts or purchases already use creates a NEW rule version (existing accounts keep their rules)
+    const result = await updatePlanVersioned(id, parse(planSchema.partial(), req.body));
+    await audit({
+      actorId: req.user!.id,
+      action: result.versioned ? 'plan.versioned' : 'plan.updated',
+      entity: 'Plan',
+      entityId: result.plan.id,
+      metadata: result.versioned ? { previousPlanId: result.previousPlanId, ruleVersion: result.plan.ruleVersion } : undefined,
+    });
+    return { ...result.plan, versioned: result.versioned, previousPlanId: result.previousPlanId ?? null };
   });
 
   // ------------------------------- Markets -----------------------------

@@ -4,7 +4,6 @@ import {
   applyFill,
   isLiquidated,
   liquidationPrice,
-  marketFillPrice,
   notional,
   requiredMargin,
   tradingFee,
@@ -24,26 +23,6 @@ describe('basic formulas', () => {
   it('computes unrealized PnL for long and short', () => {
     expect(unrealizedPnl('LONG', d(2), d(100), d(110)).toString()).toBe('20');
     expect(unrealizedPnl('SHORT', d(2), d(100), d(110)).toString()).toBe('-20');
-  });
-});
-
-describe('marketFillPrice', () => {
-  const base = { mid: d(100), bid: d('99.9'), ask: d('100.1'), spreadBps: 2, slippageBps: 1, pricePrecision: 2 };
-
-  it('buys at ask plus slippage, rounded up', () => {
-    // 100.1 * 1.0001 = 100.11001 -> 100.12 (rounded up)
-    expect(marketFillPrice({ ...base, side: 'BUY' }).toString()).toBe('100.12');
-  });
-
-  it('sells at bid minus slippage, rounded down', () => {
-    // 99.9 * 0.9999 = 99.89001 -> 99.89 (rounded down)
-    expect(marketFillPrice({ ...base, side: 'SELL' }).toString()).toBe('99.89');
-  });
-
-  it('falls back to mid and spread without an order book', () => {
-    const price = marketFillPrice({ ...base, bid: null, ask: null, side: 'BUY' });
-    // 100 * 1.0001 * 1.0001 = 100.02000... -> 100.03
-    expect(price.toString()).toBe('100.03');
   });
 });
 

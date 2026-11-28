@@ -1,8 +1,11 @@
 import type { OrderSide, PositionMode, PositionSide } from '@prisma/client';
+import { logger } from '../../config/logger';
 import { prisma, type Tx } from '../../config/prisma';
 import { ApiError } from '../../utils/api-error';
 import { Decimal, toD } from '../../utils/decimal';
-import { evaluateAccount } from '../risk/risk.service';
+import { recordHedgeAttempt } from '../risk/abuse.service';
+import { getBreachReview, requestBreachReview } from '../risk/breach-review.service';
+import { evaluateAccount, getRiskStatus, listRiskEvents } from '../risk/risk.service';
 import { computeAccountSnapshot, presentAccountOverview } from './account-snapshot';
 import { ACTIVE_STATUSES, cancelOrderRow, lockAccount, submitOrder, type OrderParams, type PriceInput } from './order-engine';
 import { previewOrder, type PreviewInput } from './order-preview';
@@ -43,11 +46,25 @@ async function assertOwner(userId: string, accountId: string) {
 // Runs one order in a transaction, then re-checks the risk rules.
 async function runOrder(userId: string, params: OrderParams) {
   await assertOwner(userId, params.accountId);
-  const result = await prisma.$transaction((tx) => submitOrder(tx, params), { timeout: 10_000, maxWait: 5_000 });
+  let result: Awaited<ReturnType<typeof submitOrder>>;
+  try {
+    result = await prisma.$transaction((tx) => submitOrder(tx, params), { timeout: 10_000, maxWait: 5_000 });
+  } catch (err) {
+    // A blocked hedge between the trader's own accounts is kept as a flag for staff review (written outside the rolled back transaction)
+    if (err instanceof ApiError && err.code === 'CROSS_ACCOUNT_HEDGE') {
+      const d = (err.details ?? {}) as { symbol?: string; openSide?: string; otherAccountId?: string };
+      await recordHedgeAttempt({ userId, accountId: params.accountId, otherAccountId: d.otherAccountId ?? '', symbol: d.symbol ?? params.symbol, openSide: d.openSide ?? '' }).catch((e) =>
+        logger.error({ err: e, accountId: params.accountId }, 'Could not record the hedge attempt'),
+      );
+    }
+    throw err;
+  }
   // Tell the terminal sessions of this account that orders / fills / positions changed (after the commit)
   if (!result.duplicate) tradingEvents.accountChanged(params.accountId, result.fills.length > 0 ? 'fill' : 'order');
   // Re-check risk rules right after a trade
-  if (!result.duplicate && result.fills.length > 0) await evaluateAccount(params.accountId).catch(() => undefined);
+  if (!result.duplicate && result.fills.length > 0) {
+    await evaluateAccount(params.accountId).catch((err) => logger.error({ err, accountId: params.accountId }, 'Risk check after order failed'));
+  }
   return { ...result, fill: result.fills[0] ?? null };
 }
 
@@ -136,8 +153,17 @@ export async function closePosition(
   userId: string,
   accountId: string,
   symbol: string,
-  options: { size?: Decimal; positionSide?: PositionSide } = {},
+  options: { size?: Decimal; positionSide?: PositionSide; clientOrderId?: string } = {},
 ) {
+  // A retried close returns the first result, even when that close already removed the position
+  if (options.clientOrderId) {
+    await assertOwner(userId, accountId);
+    const existing = await prisma.order.findUnique({ where: { accountId_clientOrderId: { accountId, clientOrderId: options.clientOrderId } } });
+    if (existing) {
+      const fills = await prisma.fill.findMany({ where: { orderId: existing.id }, orderBy: { createdAt: 'asc' } });
+      return { order: existing, fills, duplicate: true, fill: fills[0] ?? null };
+    }
+  }
   const rows = await prisma.position.findMany({
     where: { accountId, market: { symbol: symbol.toUpperCase() }, size: { gt: 0 }, ...(options.positionSide ? { side: options.positionSide } : {}) },
   });
@@ -156,6 +182,8 @@ export async function closePosition(
     leverage: position.leverage,
     reduceOnly: true,
     positionSide: position.side,
+    // A retried close (double click, timeout) returns the first result instead of closing twice
+    clientOrderId: options.clientOrderId,
   });
 }
 
@@ -210,6 +238,22 @@ export async function listMyAccounts(userId: string) {
     orderBy: { createdAt: 'desc' },
   });
 }
+
+// Live risk and performance view: floors, room, profit target progress, exposure, margin and trading results.
+export async function getAccountRisk(userId: string, accountId: string) {
+  await assertOwner(userId, accountId);
+  return getRiskStatus(accountId);
+}
+
+// Paginated risk and breach history of the account (newest first).
+export async function getAccountRiskEvents(userId: string, accountId: string, opts: { limit: number; before?: Date }) {
+  await assertOwner(userId, accountId);
+  return listRiskEvents(accountId, opts);
+}
+
+// Technical breach review: request within 72 hours of a breach, and read its state.
+export const requestAccountBreachReview = (userId: string, accountId: string, reason: string) => requestBreachReview(userId, accountId, reason);
+export const getAccountBreachReview = (userId: string, accountId: string) => getBreachReview(userId, accountId);
 
 export async function getAccountOverview(userId: string, accountId: string) {
   const account = await assertOwner(userId, accountId);

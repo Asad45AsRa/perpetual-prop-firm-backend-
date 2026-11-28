@@ -1,6 +1,13 @@
 import Decimal from 'decimal.js';
 import { describe, expect, it } from 'vitest';
-import { isMarketable, isTriggered, restingLimitCrossed, triggerDirection } from '../src/modules/trading/engine/matching';
+import {
+  isMarketable,
+  isTriggered,
+  marketableLimitFillPrice,
+  restingLimitCrossed,
+  triggerDirection,
+  triggerFillPrice,
+} from '../src/modules/trading/engine/matching';
 import { classifyOrder } from '../src/modules/trading/engine/positions';
 
 const d = (v: Decimal.Value) => new Decimal(v);
@@ -10,22 +17,28 @@ const q = (bid: number | null, ask: number | null, mark: number | null) => ({
   mark: mark == null ? null : d(mark),
 });
 
-describe('limit order eligibility', () => {
-  it('is marketable when it crosses the opposite best price', () => {
+describe('limit order rules (mark based)', () => {
+  it('is marketable when it crosses the opposite best price OR the mark', () => {
     expect(isMarketable('BUY', d(90020), q(89990, 90000, 90000))).toBe(true);
-    expect(isMarketable('BUY', d(90000), q(89990, 90100, 90000))).toBe(false);
+    expect(isMarketable('BUY', d(90000), q(89990, 90100, 90000))).toBe(true); // mark touches the limit
+    expect(isMarketable('BUY', d(89990), q(89980, 90100, 90000))).toBe(false);
     expect(isMarketable('SELL', d(89990), q(89990, 90000, 90000))).toBe(true);
   });
 
-  it('fills a resting buy only when the ASK touches the limit, mark alone is not enough', () => {
-    expect(restingLimitCrossed('BUY', d(90000), q(89995, 90005, 89950), false)).toBe(false);
-    expect(restingLimitCrossed('BUY', d(90000), q(89995, 90000, 89950), false)).toBe(true);
+  it('a marketable limit fills at the fresh mark, never worse than the limit', () => {
+    expect(marketableLimitFillPrice('BUY', d(90050), d(90000)).toString()).toBe('90000');
+    expect(marketableLimitFillPrice('BUY', d(89990), d(90000)).toString()).toBe('89990');
+    expect(marketableLimitFillPrice('SELL', d(89950), d(90000)).toString()).toBe('90000');
+    expect(marketableLimitFillPrice('SELL', d(90010), d(90000)).toString()).toBe('90010');
   });
 
-  it('needs the mark on the right side too when the market requires mark confirmation', () => {
-    expect(restingLimitCrossed('BUY', d(90000), q(89995, 90000, 90010), true)).toBe(false);
-    expect(restingLimitCrossed('BUY', d(90000), q(89995, 90000, 89990), true)).toBe(true);
-    expect(restingLimitCrossed('SELL', d(90100), q(90100, 90110, 90090), true)).toBe(false);
+  it('a resting limit fills only when the MARK crosses it (the book is not used)', () => {
+    expect(restingLimitCrossed('BUY', d(90000), d(90010))).toBe(false);
+    expect(restingLimitCrossed('BUY', d(90000), d(90000))).toBe(true);
+    expect(restingLimitCrossed('BUY', d(90000), d(89999))).toBe(true);
+    expect(restingLimitCrossed('SELL', d(90100), d(90090))).toBe(false);
+    expect(restingLimitCrossed('SELL', d(90100), d(90100))).toBe(true);
+    expect(restingLimitCrossed('BUY', d(90000), null)).toBe(false);
   });
 });
 
@@ -39,25 +52,25 @@ describe('trigger rules', () => {
     expect(triggerDirection('STOP_LOSS', 'BUY')).toBe('UP');
   });
 
-  it('long stop loss fires on the mark OR on the bid touching the level', () => {
+  it('triggers use the MARK only: a touching bid or ask does not fire the order', () => {
     expect(isTriggered('STOP_LOSS', 'SELL', d(89000), q(89500, 89510, 90000))).toBe(false);
-    expect(isTriggered('STOP_LOSS', 'SELL', d(89000), q(89000, 89010, 89500))).toBe(true); // bid touch
+    expect(isTriggered('STOP_LOSS', 'SELL', d(89000), q(89000, 89010, 89500))).toBe(false); // bid touch is ignored
     expect(isTriggered('STOP_LOSS', 'SELL', d(89000), q(89500, 89510, 89000))).toBe(true); // mark touch
+    expect(isTriggered('TAKE_PROFIT', 'SELL', d(91000), q(91000, 91010, 90990))).toBe(false);
+    expect(isTriggered('TAKE_PROFIT', 'SELL', d(91000), q(90990, 91000, 91000))).toBe(true);
   });
 
-  it('long take profit fires when the bid touches, even if the mark is lower', () => {
-    expect(isTriggered('TAKE_PROFIT', 'SELL', d(91000), q(91000, 91010, 90990))).toBe(true);
-  });
-
-  it('short take profit uses the ask, short stop loss uses the ask going up', () => {
-    expect(isTriggered('TAKE_PROFIT', 'BUY', d(89000), q(88990, 89000, 89500))).toBe(true);
-    expect(isTriggered('STOP_LOSS', 'BUY', d(91000), q(90990, 91000, 90500))).toBe(true);
+  it('short side and entry stops', () => {
+    expect(isTriggered('TAKE_PROFIT', 'BUY', d(89000), q(88990, 89000, 88990))).toBe(true);
     expect(isTriggered('STOP_LOSS', 'BUY', d(91000), q(90000, 90010, 90500))).toBe(false);
+    expect(isTriggered('STOP_LOSS', 'BUY', d(91000), q(90990, 91000, 91001))).toBe(true);
+    expect(isTriggered('STOP_MARKET', 'BUY', d(91000), q(90000, 90010, 90005))).toBe(false);
+    expect(isTriggered('STOP_MARKET', 'BUY', d(91000), q(90990, 91000, 91000))).toBe(true);
   });
 
-  it('a buy stop entry fires on a rise', () => {
-    expect(isTriggered('STOP_MARKET', 'BUY', d(91000), q(90990, 91000, 90500))).toBe(true);
-    expect(isTriggered('STOP_MARKET', 'BUY', d(91000), q(90000, 90010, 90005))).toBe(false);
+  it('a stop fills at its trigger price, or at the first fresh mark after an outage', () => {
+    expect(triggerFillPrice(d(89000), d(88500), false).toString()).toBe('89000');
+    expect(triggerFillPrice(d(89000), d(88500), true).toString()).toBe('88500');
   });
 });
 

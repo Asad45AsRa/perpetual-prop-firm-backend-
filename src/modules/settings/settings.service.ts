@@ -33,6 +33,21 @@ export const SETTING_DEFAULTS = {
     // Version string stored on every fill
     rulesVersion: 'engine-1.0',
   },
+  // Protection of the firm against harmful trading behaviour (Risk Engine specification v1.1)
+  risk: {
+    // Reject an order that opens the opposite side of a market that another account of the same trader already holds
+    blockCrossAccountHedge: true,
+    // Background scan for cross-account hedging, copy trading and latency abuse (findings are flags for staff review)
+    abuseScanEnabled: true,
+    // Copy trading: this many accounts opening the same trade within this window, repeated this many times
+    copyTradingWindowSeconds: 5,
+    copyTradingMinAccounts: 3,
+    copyTradingMinRepeats: 3,
+    // Latency abuse: average hold below this, win rate above this, with at least this many closed trades in 7 days
+    latencyMaxAvgHoldSeconds: 30,
+    latencyMinWinRatePct: 80,
+    latencyMinCloses: 20,
+  },
   payout: {
     profitSplitPct: '80',
     minPayoutUsd: '50',

@@ -1,18 +1,46 @@
-# =====================================================================
-# FILE:   backend/docs/openapi-rbac.yaml   (REPLACE the existing file)
-# FOLDER: backend/docs/
-# LIVE DATA ONLY: every market, price, order book, trade and candle described here is served
-# from the live Hyperliquid feed through our backend. There is no mock, fake, sample or
-# placeholder data anywhere in this API. Examples below only show the SHAPE of a response.
-# =====================================================================
 openapi: 3.0.3
 info:
   title: Perpetual Prop Firm API - Auth, RBAC, Markets & Trading
-  version: 2.3.0
+  version: 2.5.0
   description: |
     **Scope now: authentication, RBAC, Hyperliquid market data, the trading engine and admin market management.**
     Payments, payouts, affiliate and the other admin feature endpoints are still left out of this file (kept commented
     at the bottom) and will be documented when they are wired.
+
+    ### What is new in 2.5.0 (Risk Engine specification v1.1, 25 Nov 2026; protection against harmful trading)
+    - **Rule versions:** a rule change on a plan that accounts or purchases already use (`PATCH /admin/plans/{id}`) creates a NEW plan row
+      (`ruleVersion` + 1, `supersedesId`) and deactivates the old one. Existing accounts keep the rules they were bought with. `GET .../risk` shows `ruleVersion`.
+    - **Daily snapshot:** one immutable `DailyRiskSnapshot` per account and UTC date. The day-start balance is rebuilt from the ledger state at 00:00 UTC, so a late or
+      repeated job gives the same result.
+    - **Payout rebase:** when a payout is approved (the balance is deducted) the daily floor is rebased ONCE from the remaining balance
+      (`allowance = rate x max(startingBalance, remaining)`). The static floor is unchanged; a rejected payout never rebases.
+    - **Breach evidence:** the breach risk event stores both floor observations (`dailyFloorHit`, `staticFloorHit`), `breachedAt` and `reviewDeadline` (72 hours).
+      `GET .../risk` returns `breach` with the review state.
+    - **Technical breach review:** `POST/GET /trading/accounts/{accountId}/breach-review` (72 hour window, one per breach); staff resolve it under `/admin/risk/breach-reviews`.
+      A resolution records the decision only; a correction is a separate audited compensating action.
+    - **Risk history:** `GET /trading/accounts/{accountId}/risk-events` (newest first, cursor `nextBefore`).
+    - **Hedging between a trader's own accounts is blocked:** an order that opens the opposite side of a market that another ACTIVE account of the same trader holds is
+      rejected with `CROSS_ACCOUNT_HEDGE` (HTTP 422). Hedging inside one account is impossible (one-way mode). Setting `risk.blockCrossAccountHedge` switches the block off.
+    - **Abuse scan (every 5 minutes):** cross-account hedging, copy trading (3+ accounts opening the same trade within 5 s, 3+ times in 24 h) and latency abuse (average hold
+      under 30 s with a win rate above 80 percent, 20+ closed trades in 7 days) create **flags for staff review** (`/admin/risk/abuse-flags`). A flag never locks an account
+      by itself: staff confirm or dismiss it, and act with the audited manual lock.
+
+    ### What is new in 2.4.0 (risk engine, challenge evaluation, account safety; Terminal Implementation Specification v1.0, 23 Nov 2026)
+    - **New `GET /trading/accounts/{accountId}/risk`:** equity, daily and static floors with the room above each, the profit target progress (net of exit fees),
+      exposure, margin and trading results, computed by the server.
+    - **Daily loss:** `allowance = dailyLossPct x max(startingBalance, UTC day-start realized balance)`, `daily floor = day-start realized balance - allowance`.
+      The day-start balance snaps at 00:00 UTC (a missed reset is caught up at start-up and a reset never runs twice for the same day).
+    - **Static drawdown:** `floor = startingBalance x (1 - maxDrawdownPct)`. It never trails the equity.
+    - **Hard breach = equity <= max(daily floor, static floor)** (equality fails). The account is set to `BREACHED` (challenge) or `DISABLED` (funded) in one
+      transaction: working orders are cancelled, every position is closed at the server mark (ordinary taker exit fee, no penalty) and a risk event with the equity,
+      the floors and the marks is stored. A breach is never decided on a stale mark; the account is evaluated again with the first fresh mark.
+    - **Margin-only forced close** (equity <= total maintenance threshold) happens only for an account that is not breached and does not fail it.
+    - **Challenge pass:** only when the NET settled balance (positions closed, exit fees booked) is >= `startingBalance x (1 + profitTargetPct)`, with no breach,
+      and `minTradingDays` is met. A target that is reached only before the exit fees does not pass. The funded account starts at the original starting balance.
+    - **New rejection `WOULD_BREACH` (HTTP 422):** an opening order is refused when its entry fee would put the equity at or below a risk floor.
+      The order preview reports it as well and returns `effectiveFloor`, `riskRoom` and `riskRoomAfterFee`.
+    - **Duplicate protection:** placing an order now REQUIRES an `Idempotency-Key` header (or `clientOrderId`), otherwise HTTP 400 `IDEMPOTENCY_KEY_REQUIRED`.
+      A retry always returns the original order (HTTP 200, `duplicate: true`), even if that order locked the account. Closing a position accepts the same header.
 
     ### What is new in 2.3.0 (trading engine aligned with the Terminal Implementation Specification v1.0)
     - **The server mark price is the only execution price.** Market orders fill in full at the fresh mark (zero slippage, taker).
@@ -108,7 +136,9 @@ info:
     `INVALID_TICK`, `BELOW_MIN_NOTIONAL`, `LEVERAGE_CAP`, `LIQUIDITY_GUARD`, `LIQUIDITY_UNAVAILABLE`, `POST_ONLY_WOULD_TAKE`, `TRIGGER_WOULD_FIRE`,
     `POSITION_SIDE_REQUIRED`, `INVALID_POSITION_SIDE`, `NO_POSITION`, `REDUCE_ONLY`, `RESIDUAL_BELOW_MIN`, `EXIT_LEG_LIMIT`, `EXIT_SIZE_EXCEEDS_POSITION`,
     `OPEN_ORDER_LIMIT`, `OPEN_POSITION_LIMIT`, `POSITION_CAP`, `GROSS_EXPOSURE_CAP`, `INSUFFICIENT_MARGIN`, `POSITION_MODE_LOCKED`, `HEDGE_NOT_AVAILABLE`,
-    `ORDER_ALREADY_FILLED`, `ORDER_NOT_ACTIVE`, and `NO_PRICE` (no price/book received yet for a market).
+    `ORDER_ALREADY_FILLED`, `ORDER_NOT_ACTIVE`, `WOULD_BREACH` (the entry fee would take the equity to the daily / static floor), and `NO_PRICE` (no price/book received yet for a market).
+    `CROSS_ACCOUNT_HEDGE` (another account of the same trader holds the opposite side of this market).
+    `IDEMPOTENCY_KEY_REQUIRED` is returned with HTTP **400** (an order without `Idempotency-Key` / `clientOrderId`).
     `ORDER_RATE_LIMIT` is returned with HTTP **429** (more than 5 exposure-increasing orders per second or 120 per minute for one account).
 
     ## Market data WebSocket
@@ -172,6 +202,8 @@ tags:
     description: Public live market data for the trading terminal (markets table, market bar, order book with grouping, trades, candles). Served by our backend only.
   - name: Trading
     description: Trader terminal. Orders, positions and account history. Portal `TRADER` + ownership of the account.
+  - name: Risk review
+    description: Technical breach review of the trader (72 hours after a breach) and the staff review of abuse flags. Admin page `risk`.
   - name: Admin markets
     description: Market registry (sync from Hyperliquid, limits, fees, close-only, halt). Admin page `markets`.
   # - name: Route matrix   (commented for now: other non auth/RBAC routes)
@@ -808,6 +840,9 @@ components:
         estimatedFee: { type: string }
         balanceAfterFee: { type: string }
         marginCapacity: { type: string, description: New-entry capacity before this order. }
+        effectiveFloor: { type: string, description: 'The higher of the daily and static equity floors. The account fails when the equity reaches it.' }
+        riskRoom: { type: string, description: Equity above the effective floor before this order. }
+        riskRoomAfterFee: { type: string, description: 'Equity above the effective floor after the fee of this order (0 or less = WOULD_BREACH).' }
         grossExposure: { type: string }
         grossExposureLimit: { type: string }
         maxNotionalUsd: { type: string, nullable: true, description: Largest valid notional of a new entry right now. }
@@ -826,6 +861,133 @@ components:
             code: { type: string }
             message: { type: string }
         note: { type: string }
+    RiskStatus:
+      type: object
+      description: |
+        Live risk and performance view of one account, computed by the server from the ledger and the live marks.
+        `feedHealthy: false` means a mark of an open position is stale: the account is not evaluated until a fresh mark arrives.
+      properties:
+        accountId: { type: string, format: uuid }
+        stage: { type: string, enum: [CHALLENGE, FUNDED] }
+        status: { type: string, enum: [ACTIVE, PASSED, BREACHED, DISABLED] }
+        statusReason: { type: string, nullable: true }
+        asOf: { type: string, format: date-time }
+        feedHealthy: { type: boolean }
+        ruleVersion: { type: integer, description: Rule version of the plan this account was bought with. }
+        breach:
+          type: object
+          nullable: true
+          description: Set after a daily / static breach.
+          properties:
+            eventId: { type: string, format: uuid }
+            type: { type: string, enum: [DAILY_LOSS_BREACH, MAX_DRAWDOWN_BREACH] }
+            at: { type: string, format: date-time }
+            reviewDeadline: { type: string, format: date-time, description: Until when a technical review can be requested (72 hours). }
+            review: { type: object, nullable: true, description: The review request, if any. }
+        startingBalance: { type: string }
+        balance: { type: string, description: Realized balance (ledger). }
+        equity: { type: string, description: Balance + floating PnL at the live marks. }
+        unrealizedPnl: { type: string }
+        dailyLoss:
+          type: object
+          properties:
+            ratePct: { type: string, example: '3' }
+            dayStartBalance: { type: string, description: Realized balance at the last 00:00 UTC. }
+            allowance: { type: string, description: 'ratePct x max(startingBalance, dayStartBalance).' }
+            floor: { type: string, description: 'dayStartBalance - allowance.' }
+            room: { type: string, description: Equity minus the daily floor (0 or less = breached). }
+            lossToday: { type: string, description: 'Loss since the day start (0 when the equity is above it).' }
+            lastResetAt: { type: string, format: date-time, nullable: true }
+        staticDrawdown:
+          type: object
+          properties:
+            ratePct: { type: string, example: '6' }
+            limit: { type: string, description: startingBalance x ratePct. }
+            floor: { type: string, description: 'startingBalance x (1 - ratePct). Never trails.' }
+            room: { type: string }
+            loss: { type: string }
+        effectiveFloor: { type: string, description: The higher of the two floors. }
+        bindingRule: { type: string, enum: [DAILY_LOSS, MAX_DRAWDOWN] }
+        riskRoom: { type: string, description: Equity minus the effective floor. }
+        profitTarget:
+          type: object
+          description: Only meaningful when `enabled` is true (challenge stage with a target above zero).
+          properties:
+            enabled: { type: boolean }
+            ratePct: { type: string }
+            targetProfit: { type: string }
+            targetBalance: { type: string, description: 'startingBalance x (1 + ratePct).' }
+            profit: { type: string, description: Equity minus startingBalance. }
+            estimatedExitFees: { type: string, description: Taker fees to close every position at the current marks. }
+            netProjected: { type: string, description: Equity minus the estimated exit fees. }
+            progressPct: { type: string, description: 0 to 100, based on netProjected. }
+            remaining: { type: string }
+            minTradingDays: { type: integer }
+            tradingDays: { type: integer }
+        exposure:
+          type: object
+          properties:
+            gross: { type: string }
+            limit: { type: string }
+            multiple: { type: integer }
+            overCap: { type: boolean }
+        margin:
+          type: object
+          properties:
+            used: { type: string }
+            reserved: { type: string }
+            free: { type: string }
+            available: { type: string }
+            maintenance: { type: string }
+        performance:
+          type: object
+          description: A close is a fill that realized a profit or a loss.
+          properties:
+            fills: { type: integer }
+            realizedPnl: { type: string }
+            fees: { type: string }
+            netRealizedPnl: { type: string }
+            winningCloses: { type: integer }
+            losingCloses: { type: integer }
+            winRatePct: { type: string, nullable: true }
+            tradingDays: { type: integer }
+    RiskEvent:
+      type: object
+      properties:
+        id: { type: string, format: uuid }
+        type: { type: string, enum: [DAILY_LOSS_BREACH, MAX_DRAWDOWN_BREACH, LIQUIDATION, PROFIT_TARGET_REACHED, STALE_PRICE_BLOCK, MANUAL_LOCK] }
+        createdAt: { type: string, format: date-time }
+        details:
+          type: object
+          additionalProperties: true
+          description: |
+            Evidence of the decision: equity, balance, day-start balance, daily / static / effective floor, `dailyFloorHit`, `staticFloorHit`, `ruleVersion`, the marks used (symbol,
+            mark, age) and the closed fills. A breach also has `breachedAt` and `reviewDeadline`.
+    BreachReview:
+      type: object
+      properties:
+        id: { type: string, format: uuid }
+        accountId: { type: string, format: uuid }
+        riskEventId: { type: string, format: uuid }
+        reason: { type: string }
+        status: { type: string, enum: [OPEN, APPROVED, REJECTED] }
+        deadlineAt: { type: string, format: date-time }
+        requestedAt: { type: string, format: date-time }
+        resolvedAt: { type: string, format: date-time, nullable: true }
+        resolutionNote: { type: string, nullable: true }
+    AbuseFlag:
+      type: object
+      properties:
+        id: { type: string, format: uuid }
+        type: { type: string, enum: [CROSS_ACCOUNT_HEDGE, COPY_TRADING, LATENCY_ABUSE] }
+        status: { type: string, enum: [OPEN, CONFIRMED, DISMISSED] }
+        accountId: { type: string, format: uuid }
+        relatedAccountIds: { type: array, items: { type: string, format: uuid } }
+        summary: { type: string }
+        evidence: { type: object, additionalProperties: true }
+        reviewedAt: { type: string, format: date-time, nullable: true }
+        reviewNote: { type: string, nullable: true }
+        createdAt: { type: string, format: date-time }
     ClosePositionRequest:
       type: object
       properties:
@@ -1591,6 +1753,230 @@ paths:
         '401': { $ref: '#/components/responses/Unauthorized' }
         '403': { $ref: '#/components/responses/Forbidden' }
         '404': { $ref: '#/components/responses/NotFound' }
+  /api/v1/trading/accounts/{accountId}/risk-events:
+    get:
+      tags: [Trading]
+      summary: Risk and breach history of the account (newest first)
+      description: Audit-safe evidence of every risk decision (breach, forced close, pass). Page with `before` = `nextBefore` of the previous page.
+      security: [{ customerCookie: [] }]
+      x-rbac: portal:TRADER + ownership
+      parameters:
+        - { $ref: '#/components/parameters/AccountIdParam' }
+        - { name: limit, in: query, schema: { type: integer, minimum: 1, maximum: 100, default: 25 } }
+        - { name: before, in: query, description: createdAt of the last item of the previous page., schema: { type: string, format: date-time } }
+      responses:
+        '200':
+          description: Page of risk events
+          content:
+            application/json:
+              schema:
+                type: object
+                properties:
+                  items: { type: array, items: { $ref: '#/components/schemas/RiskEvent' } }
+                  nextBefore: { type: string, format: date-time, nullable: true }
+        '401': { $ref: '#/components/responses/Unauthorized' }
+        '404': { $ref: '#/components/responses/NotFound' }
+  /api/v1/trading/accounts/{accountId}/breach-review:
+    post:
+      tags: [Risk review]
+      summary: Request a technical breach review (within 72 hours of the breach)
+      description: |
+        For inaccurate market data, a proven outage, a duplicate fill, a software fault or a wrong risk calculation. It is not a way to reverse a legitimate loss-limit violation.
+        One request per breach. After the deadline the call fails with 422 `REVIEW_WINDOW_CLOSED` (the response shows `deadlineAt`).
+      security: [{ customerCookie: [] }]
+      x-rbac: portal:TRADER + ownership
+      parameters: [{ $ref: '#/components/parameters/AccountIdParam' }]
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              type: object
+              required: [reason]
+              properties:
+                reason: { type: string, minLength: 10, maxLength: 2000 }
+      responses:
+        '201': { description: Review opened, content: { application/json: { schema: { $ref: '#/components/schemas/BreachReview' } } } }
+        '401': { $ref: '#/components/responses/Unauthorized' }
+        '404': { $ref: '#/components/responses/NotFound' }
+        '409': { description: A review was already requested for this breach., content: { application/json: { schema: { $ref: '#/components/schemas/Error' } } } }
+        '422': { description: '`NO_BREACH` or `REVIEW_WINDOW_CLOSED`.', content: { application/json: { schema: { $ref: '#/components/schemas/Error' } } } }
+    get:
+      tags: [Risk review]
+      summary: State of the review of the latest breach
+      security: [{ customerCookie: [] }]
+      x-rbac: portal:TRADER + ownership
+      parameters: [{ $ref: '#/components/parameters/AccountIdParam' }]
+      responses:
+        '200':
+          description: Latest breach with its deadline and review (null when the account never breached)
+          content:
+            application/json:
+              schema:
+                type: object
+                nullable: true
+                properties:
+                  breachEventId: { type: string, format: uuid }
+                  breachedAt: { type: string, format: date-time }
+                  deadlineAt: { type: string, format: date-time }
+                  review: { allOf: [{ $ref: '#/components/schemas/BreachReview' }], nullable: true }
+        '401': { $ref: '#/components/responses/Unauthorized' }
+        '404': { $ref: '#/components/responses/NotFound' }
+  /api/v1/admin/plans/{id}:
+    patch:
+      tags: [Risk review]
+      summary: Edit a plan (rule changes create a new rule version)
+      description: |
+        Price, name and the active flag are edited in place. A change of a rule value (size, target, daily loss, drawdown, leverage, exposure multiple, minimum trading days) on a plan that
+        accounts or purchases already use creates a NEW plan row (`ruleVersion` + 1) and deactivates the old one, so existing accounts keep their purchase-time rules.
+      security: [{ adminCookie: [] }]
+      x-rbac: section:plans:manage
+      parameters: [{ $ref: '#/components/parameters/IdParam' }]
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema: { type: object, additionalProperties: true }
+      responses:
+        '200':
+          description: The updated plan, or the new version. `versioned` is true when a new row was created (`previousPlanId` = the old row).
+          content:
+            application/json:
+              schema:
+                type: object
+                additionalProperties: true
+                properties:
+                  versioned: { type: boolean }
+                  previousPlanId: { type: string, format: uuid, nullable: true }
+        '401': { $ref: '#/components/responses/Unauthorized' }
+        '403': { $ref: '#/components/responses/Forbidden' }
+  /api/v1/admin/risk/abuse-flags:
+    get:
+      tags: [Risk review]
+      summary: Abuse flags (cross-account hedging, copy trading, latency abuse)
+      security: [{ adminCookie: [] }]
+      x-rbac: section:risk:view
+      parameters:
+        - { name: status, in: query, schema: { type: string, enum: [OPEN, CONFIRMED, DISMISSED] } }
+        - { name: type, in: query, schema: { type: string, enum: [CROSS_ACCOUNT_HEDGE, COPY_TRADING, LATENCY_ABUSE] } }
+        - { name: accountId, in: query, schema: { type: string, format: uuid } }
+        - { name: page, in: query, schema: { type: integer, minimum: 1, default: 1 } }
+        - { name: pageSize, in: query, schema: { type: integer, minimum: 1, maximum: 100, default: 25 } }
+      responses:
+        '200':
+          description: Page of flags
+          content:
+            application/json:
+              schema:
+                type: object
+                properties:
+                  items: { type: array, items: { $ref: '#/components/schemas/AbuseFlag' } }
+                  total: { type: integer }
+                  page: { type: integer }
+                  pageSize: { type: integer }
+        '401': { $ref: '#/components/responses/Unauthorized' }
+        '403': { $ref: '#/components/responses/Forbidden' }
+  /api/v1/admin/risk/abuse-flags/{id}/resolve:
+    post:
+      tags: [Risk review]
+      summary: Confirm or dismiss an abuse flag
+      description: Records the decision only. Acting on a confirmed flag (lock the account, void trades) is a separate audited admin action.
+      security: [{ adminCookie: [] }]
+      x-rbac: section:risk:manage + right:risk.review
+      parameters: [{ $ref: '#/components/parameters/IdParam' }]
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              type: object
+              required: [decision, note]
+              properties:
+                decision: { type: string, enum: [CONFIRMED, DISMISSED] }
+                note: { type: string, minLength: 3, maxLength: 2000 }
+      responses:
+        '200': { description: Resolved flag, content: { application/json: { schema: { $ref: '#/components/schemas/AbuseFlag' } } } }
+        '404': { $ref: '#/components/responses/NotFound' }
+        '409': { description: The flag was already resolved., content: { application/json: { schema: { $ref: '#/components/schemas/Error' } } } }
+  /api/v1/admin/risk/abuse-scan:
+    post:
+      tags: [Risk review]
+      summary: Run the abuse scan now (it also runs every 5 minutes)
+      security: [{ adminCookie: [] }]
+      x-rbac: section:risk:manage + right:risk.review
+      responses:
+        '200':
+          description: Number of NEW flags per detector
+          content:
+            application/json:
+              schema:
+                type: object
+                properties:
+                  hedge: { type: integer }
+                  copyTrading: { type: integer }
+                  latency: { type: integer }
+                  skipped: { type: boolean, description: True when the scan is switched off in the settings. }
+  /api/v1/admin/risk/breach-reviews:
+    get:
+      tags: [Risk review]
+      summary: Technical breach reviews (oldest first)
+      security: [{ adminCookie: [] }]
+      x-rbac: section:risk:view
+      parameters:
+        - { name: status, in: query, schema: { type: string, enum: [OPEN, APPROVED, REJECTED] } }
+        - { name: page, in: query, schema: { type: integer, minimum: 1, default: 1 } }
+        - { name: pageSize, in: query, schema: { type: integer, minimum: 1, maximum: 100, default: 25 } }
+      responses:
+        '200':
+          description: Page of reviews
+          content:
+            application/json:
+              schema:
+                type: object
+                properties:
+                  items: { type: array, items: { $ref: '#/components/schemas/BreachReview' } }
+                  total: { type: integer }
+                  page: { type: integer }
+                  pageSize: { type: integer }
+        '401': { $ref: '#/components/responses/Unauthorized' }
+        '403': { $ref: '#/components/responses/Forbidden' }
+  /api/v1/admin/risk/breach-reviews/{id}/resolve:
+    post:
+      tags: [Risk review]
+      summary: Approve or reject a technical breach review
+      description: Records the decision. The original breach event is never erased; an approved correction is a separate authorized compensating ledger action.
+      security: [{ adminCookie: [] }]
+      x-rbac: section:risk:manage + right:risk.review
+      parameters: [{ $ref: '#/components/parameters/IdParam' }]
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              type: object
+              required: [decision, note]
+              properties:
+                decision: { type: string, enum: [APPROVED, REJECTED] }
+                note: { type: string, minLength: 3, maxLength: 2000 }
+      responses:
+        '200': { description: Resolved review, content: { application/json: { schema: { $ref: '#/components/schemas/BreachReview' } } } }
+        '404': { $ref: '#/components/responses/NotFound' }
+        '409': { description: The review was already resolved., content: { application/json: { schema: { $ref: '#/components/schemas/Error' } } } }
+  /api/v1/trading/accounts/{accountId}/risk:
+    get:
+      tags: [Trading]
+      summary: Live risk view (equity, daily / static floors and room, profit target progress, exposure, margin, trading results)
+      description: |
+        Server-computed. Breach rule: equity <= max(daily floor, static floor). The profit target is judged on the NET balance after the exit fees.
+        Poll it or use the `/ws/account` stream for the live overview.
+      security: [{ customerCookie: [] }]
+      x-rbac: portal:TRADER + ownership
+      parameters: [{ $ref: '#/components/parameters/AccountIdParam' }]
+      responses:
+        '200': { description: Risk status, content: { application/json: { schema: { $ref: '#/components/schemas/RiskStatus' } } } }
+        '401': { $ref: '#/components/responses/Unauthorized' }
+        '403': { $ref: '#/components/responses/Forbidden' }
+        '404': { $ref: '#/components/responses/NotFound' }
   /api/v1/trading/accounts/{accountId}/orders/preview:
     post:
       tags: [Trading]
@@ -1622,8 +2008,9 @@ paths:
       tags: [Trading]
       summary: Place an order (market, limit, stop, take profit, stop loss)
       description: |
-        Idempotent: send the `Idempotency-Key` header (max 64 chars) or `clientOrderId` in the body. A replay returns HTTP 200
-        with `duplicate: true`; a new order returns 201. Limited to 30 writes per second per user.
+        Idempotent: an `Idempotency-Key` header (1 to 64 chars) or `clientOrderId` in the body is REQUIRED (HTTP 400 `IDEMPOTENCY_KEY_REQUIRED` without one). A replay returns HTTP 200
+        with `duplicate: true` and the original order and fills, even when the account was locked in the meantime; a new order returns 201. Limited to 30 writes per second per user.
+        An opening order is rejected with `WOULD_BREACH` when its entry fee would take the equity to the daily / static loss floor.
         Execution follows the spec: the server mark is the fill price (see PlaceOrderRequest). Fills are posted through the ledger (`REALIZED_PNL`, `FEE`)
         and risk rules are re-checked right after a trade.
         Limits: 50 pending opening orders, 20 open positions (one net position per symbol), 10 exit orders per position, minimum order value and lot / tick grid,
@@ -1632,7 +2019,7 @@ paths:
       security: [{ customerCookie: [] }]
       x-rbac: portal:TRADER + ownership
       parameters:
-        - { name: Idempotency-Key, in: header, required: false, schema: { type: string, maxLength: 64 } }
+        - { name: Idempotency-Key, in: header, required: false, description: 'Required unless `clientOrderId` is sent in the body.', schema: { type: string, minLength: 1, maxLength: 64 } }
       requestBody:
         required: true
         content:
@@ -1736,11 +2123,13 @@ paths:
       description: |
         Reduce-only market order at the fresh server mark (taker fee, no slippage). A partial close that would leave less than the minimum order value is
         rejected (`RESIDUAL_BELOW_MIN`): close the whole position instead.
+        Send an optional `Idempotency-Key` so a retried close returns the first result instead of closing twice.
       security: [{ customerCookie: [] }]
       x-rbac: portal:TRADER + ownership
       parameters:
         - { $ref: '#/components/parameters/AccountIdParam' }
         - { $ref: '#/components/parameters/SymbolParam' }
+        - { name: Idempotency-Key, in: header, required: false, schema: { type: string, minLength: 1, maxLength: 64 } }
       requestBody:
         required: false
         content:

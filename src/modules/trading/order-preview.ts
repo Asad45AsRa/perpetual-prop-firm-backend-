@@ -11,6 +11,7 @@ import { bestAsk, bestBid } from './engine/orderbook';
 import { classifyOrder, openingSideOf } from './engine/positions';
 import { checkPrice, checkSize } from './engine/validation';
 import { legsFromRows, liquidityLimitUsd, liveQuote, loadState, reservationFor } from './order-engine';
+import { isHardBreach } from '../risk/risk-rules';
 
 // =====================================================================
 // Trade preview for the order ticket (spec section 3 "Trade preview").
@@ -164,6 +165,10 @@ export async function previewOrder(tx: Tx, input: PreviewInput) {
     if (notional.lt(toD(market.minNotionalUsd))) fail('BELOW_MIN_NOTIONAL', `Minimum order value is ${market.minNotionalUsd.toString()} USD`);
     if (!liquidityCap) fail('LIQUIDITY_UNAVAILABLE', 'Order book depth is not available yet');
     for (const l of limits) if (openNotional.gt(l.maxNotionalUsd)) fail(l.code, l.message);
+    // A taker entry books its fee at once: refused when the equity after the fee would be at or below a risk floor (same rule as the engine)
+    if (liquidity === 'TAKER' && isHardBreach(before.equity.minus(fee), state.floors)) {
+      fail('WOULD_BREACH', 'This order would take the account to its daily or static loss limit');
+    }
   }
 
   const balanceAfter = state.balance.minus(liquidity === 'TAKER' || closeNotional.gt(0) ? fee : ZERO);
@@ -185,6 +190,10 @@ export async function previewOrder(tx: Tx, input: PreviewInput) {
     estimatedFee: fee.toFixed(6),
     balanceAfterFee: balanceAfter.toFixed(6),
     marginCapacity: before.availableMargin.toFixed(6),
+    // Risk room: equity above the effective (daily / static) floor, before and after the entry fee
+    effectiveFloor: state.floors.effectiveFloor.toFixed(6),
+    riskRoom: before.equity.minus(state.floors.effectiveFloor).toFixed(6),
+    riskRoomAfterFee: before.equity.minus(fee).minus(state.floors.effectiveFloor).toFixed(6),
     grossExposure: before.grossWithOrders.toFixed(2),
     grossExposureLimit: grossCapUsd.toFixed(2),
     // Largest valid notional of a NEW entry right now and the rule that sets it

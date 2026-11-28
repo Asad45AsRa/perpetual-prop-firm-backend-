@@ -28,6 +28,8 @@ import {
 import { bestAsk, bestBid, levelsToJson, type BookLevel, type BookSnapshot } from './engine/orderbook';
 import { classifyOrder, closingLegOf, openingSideOf, type Classification } from './engine/positions';
 import { checkPrice, checkSize } from './engine/validation';
+import { computeFloors, isHardBreach, type RiskFloors } from '../risk/risk-rules';
+import { assertNoCrossAccountHedge } from '../risk/abuse-guard';
 
 // =====================================================================
 // Transactional order engine (the only code that creates fills and moves positions).
@@ -41,6 +43,9 @@ import { checkPrice, checkSize } from './engine/validation';
 //  4. Balance changes only through the ledger (realized PnL and fee per fill).
 //  5. Cross margin: new-entry capacity = max(0, min(balance, equity) - used margin - pending margin).
 //  6. Entries are all-or-unfilled (no partial opening fills). Closing orders are capped to the open position.
+//  7. An opening fill is rejected (WOULD_BREACH) when its entry fee would put the equity at or below the daily / static floor.
+//  8. An order that opens the opposite side of a market another account of the same trader holds is rejected (CROSS_ACCOUNT_HEDGE).
+//  9. A retried request (same clientOrderId) always returns the original order, even if the account was locked in the meantime.
 // =====================================================================
 
 export type PlaceableType = 'MARKET' | 'LIMIT' | 'STOP_MARKET' | 'TAKE_PROFIT' | 'STOP_LOSS';
@@ -118,6 +123,10 @@ export interface EngineState {
   mode: 'ONE_WAY' | 'HEDGE';
   // Gross exposure cap as a multiple of CURRENT equity (plan setting: 10, Instant 3)
   grossMultiple: number;
+  // Owner of the account (cross-account hedge guard)
+  userId: string;
+  // Daily / static equity floors of the account (pre-trade breach check)
+  floors: RiskFloors;
   // Every open leg of the account (all markets)
   rows: PosRow[];
   // Working opening orders that reserve margin (without the ignored ones)
@@ -129,7 +138,14 @@ export async function loadState(tx: Tx, accountId: string, ignore: ReadonlySet<s
   const [account, positions, orders, settings] = await Promise.all([
     tx.tradingAccount.findUniqueOrThrow({
       where: { id: accountId },
-      select: { balance: true, positionMode: true, plan: { select: { grossExposureMultiple: true } } },
+      select: {
+        userId: true,
+        balance: true,
+        positionMode: true,
+        startingBalance: true,
+        dayStartBalance: true,
+        plan: { select: { grossExposureMultiple: true, dailyLossPct: true, maxDrawdownPct: true } },
+      },
     }),
     tx.position.findMany({ where: { accountId, size: { gt: 0 } }, include: { market: { select: { symbol: true, maxLeverage: true } } } }),
     tx.order.findMany({
@@ -143,6 +159,13 @@ export async function loadState(tx: Tx, accountId: string, ignore: ReadonlySet<s
     balance: toD(account.balance),
     mode: account.positionMode,
     grossMultiple: account.plan.grossExposureMultiple,
+    userId: account.userId,
+    floors: computeFloors({
+      startingBalance: toD(account.startingBalance),
+      dayStartBalance: toD(account.dayStartBalance),
+      dailyLossPct: toD(account.plan.dailyLossPct),
+      maxDrawdownPct: toD(account.plan.maxDrawdownPct),
+    }),
     rows: positions.map((p) => ({
       id: p.id,
       marketId: p.marketId,
@@ -244,6 +267,8 @@ function enforceExposure(args: {
   workingBefore: WorkingExposure[];
   workingAfter: WorkingExposure[];
   openSide: PositionSide;
+  // True for a fill (the entry fee is known): reject when the equity after the fee would be at or below a risk floor
+  checkBreach: boolean;
 }) {
   const { state, market, thisMark } = args;
   const legsBefore = legsFromRows(state.rows, market.symbol, thisMark);
@@ -260,7 +285,17 @@ function enforceExposure(args: {
     symbolSideCap: market.maxNotionalUsd ? toD(market.maxNotionalUsd) : null,
     increasesExposure: true,
   });
-  if (!rejection) return;
+  if (!rejection) {
+    // Predictable fee-induced breach: the account would fail on the spot, so the opening order is refused (spec TC-020 / TC-080)
+    if (args.checkBreach && isHardBreach(after.equity, state.floors)) {
+      reject('WOULD_BREACH', 'This order would take the account to its daily or static loss limit', {
+        equityAfter: after.equity.toFixed(8),
+        effectiveFloor: state.floors.effectiveFloor.toFixed(8),
+        bindingRule: state.floors.bindingRule,
+      });
+    }
+    return;
+  }
 
   const messages = {
     POSITION_CAP: `Position limit for ${market.symbol} would be exceeded`,
@@ -389,6 +424,8 @@ async function settle(tx: Tx, order: Order, market: Market, exec: Execution, opt
         ]
       : [];
 
+    // No hedging between the trader's own accounts (the opposite side of this market is open in another account)
+    await assertNoCrossAccountHedge(tx, { userId: state.userId, accountId: order.accountId, marketId: market.id, symbol: market.symbol, openSide: cls.openSide });
     enforceExposure({
       state,
       market,
@@ -398,6 +435,7 @@ async function settle(tx: Tx, order: Order, market: Market, exec: Execution, opt
       workingBefore: [...state.working, ...ownBefore],
       workingAfter: [...state.working, ...residualExposure],
       openSide: cls.openSide,
+      checkBreach: true,
     });
   }
 
@@ -624,11 +662,8 @@ function assertLiquidity(symbol: string, side: OrderSide, notional: Decimal) {
 export async function submitOrder(tx: Tx, params: OrderParams): Promise<OrderResult> {
   await lockAccount(tx, params.accountId);
 
-  const force = !!params.force;
-  const account = await tx.tradingAccount.findUniqueOrThrow({ where: { id: params.accountId }, include: { plan: true } });
-  if (account.status !== 'ACTIVE' && !force) reject('ACCOUNT_NOT_ACTIVE', 'This account cannot trade');
-
-  // Duplicate protection: same clientOrderId returns the original order and its fills
+  // Duplicate protection comes FIRST (before the account status check): a retry of a committed order must return that order
+  // even when the order itself caused the account to be locked. Same clientOrderId = same result, never a second execution.
   if (params.clientOrderId) {
     const existing = await tx.order.findUnique({
       where: { accountId_clientOrderId: { accountId: params.accountId, clientOrderId: params.clientOrderId } },
@@ -638,6 +673,10 @@ export async function submitOrder(tx: Tx, params: OrderParams): Promise<OrderRes
       return { order: existing, fills, duplicate: true };
     }
   }
+
+  const force = !!params.force;
+  const account = await tx.tradingAccount.findUniqueOrThrow({ where: { id: params.accountId }, include: { plan: true } });
+  if (account.status !== 'ACTIVE' && !force) reject('ACCOUNT_NOT_ACTIVE', 'This account cannot trade');
 
   const market = await tx.market.findUnique({ where: { symbol: params.symbol.toUpperCase() } });
   if (!market || !market.isEnabled) reject('MARKET_DISABLED', 'Market is not available');
@@ -887,6 +926,7 @@ async function restOrder(tx: Tx, order: Order, market: Market, ignore: ReadonlyS
   const exposure: WorkingExposure = { marketKey: market.symbol, side: openingSideOf(order.side), remaining: portion, price, reserved };
 
   if (!force) {
+    await assertNoCrossAccountHedge(tx, { userId: state.userId, accountId: order.accountId, marketId: market.id, symbol: market.symbol, openSide: openingSideOf(order.side) });
     enforceExposure({
       state,
       market,
@@ -896,6 +936,8 @@ async function restOrder(tx: Tx, order: Order, market: Market, ignore: ReadonlyS
       workingBefore: state.working,
       workingAfter: [...state.working, exposure],
       openSide: openingSideOf(order.side),
+      // No fee is booked while the order only rests; the check runs when it fills
+      checkBreach: false,
     });
   }
   return tx.order.update({ where: { id: order.id }, data: { reservedMargin: reserved.toFixed() } });

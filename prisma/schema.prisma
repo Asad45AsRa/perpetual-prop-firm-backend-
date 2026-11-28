@@ -1,10 +1,4 @@
 // =====================================================================
-// FILE:   backend/prisma/schema.prisma
-// FOLDER: backend/prisma/
-// ACTION: REPLACE the existing file (complete file).
-// Schema change only. No data is created, no mock or placeholder rows.
-// =====================================================================
-// =====================================================================
 // Perpetual Prop Firm - database schema (PostgreSQL)
 // Rules:
 //  * All money / price / size values are Decimal, never Float.
@@ -153,6 +147,26 @@ enum RiskEventType {
   LIQUIDATION
   STALE_PRICE_BLOCK
   MANUAL_LOCK
+}
+
+// Trading behaviour that harms the firm. A flag is only a finding for staff review, never an automatic punishment.
+enum AbuseFlagType {
+  CROSS_ACCOUNT_HEDGE
+  COPY_TRADING
+  LATENCY_ABUSE
+}
+
+enum AbuseFlagStatus {
+  OPEN
+  CONFIRMED
+  DISMISSED
+}
+
+// Technical breach review (Rulebook PE-1.1: the trader has 72 hours to ask for it)
+enum BreachReviewStatus {
+  OPEN
+  APPROVED
+  REJECTED
 }
 
 enum PayoutStatus {
@@ -317,6 +331,10 @@ model Plan {
   dailyLossMethod  DailyLossMethod @default(BALANCE_BASED)
   drawdownType     DrawdownType    @default(STATIC)
   isActive         Boolean         @default(true)
+  // Rule version. A plan that is already used by accounts or purchases is never edited in place: a rule change creates a new
+  // row with ruleVersion + 1 (supersedesId = the old row), so every existing account keeps the rules it was bought with.
+  ruleVersion      Int             @default(1)
+  supersedesId     String?         @db.Uuid
   createdAt        DateTime        @default(now())
   updatedAt        DateTime        @updatedAt
 
@@ -383,6 +401,9 @@ model TradingAccount {
   riskEvents    RiskEvent[]
   payouts       Payout[]
   fundingPayments FundingPayment[]
+  dailySnapshots DailyRiskSnapshot[]
+  abuseFlags    AbuseFlag[]
+  breachReviews BreachReview[]
 
   @@index([userId])
   @@index([status])
@@ -564,6 +585,70 @@ model RiskEvent {
 
   @@index([accountId, createdAt])
   @@index([type])
+}
+
+// One immutable row per account and UTC trading day (kind DAILY), plus one row per payout rebase (kind PAYOUT_REBASE:<payoutId>).
+// The unique key makes a repeated or late scheduler run, and a repeated payout event, harmless.
+model DailyRiskSnapshot {
+  id              String         @id @default(uuid()) @db.Uuid
+  accountId       String         @db.Uuid
+  account         TradingAccount @relation(fields: [accountId], references: [id])
+  tradingDate     DateTime       @db.Date
+  kind            String
+  startingBalance Decimal        @db.Decimal(20, 8)
+  // Realized balance at the UTC day boundary (rebuilt from the ledger, not from the time the job ran)
+  dayStartBalance Decimal        @db.Decimal(20, 8)
+  dayStartEquity  Decimal        @db.Decimal(20, 8)
+  dailyAllowance  Decimal        @db.Decimal(20, 8)
+  dailyFloor      Decimal        @db.Decimal(20, 8)
+  staticFloor     Decimal        @db.Decimal(20, 8)
+  payoutId        String?        @db.Uuid
+  createdAt       DateTime       @default(now())
+
+  @@unique([accountId, tradingDate, kind])
+  @@index([accountId, createdAt])
+}
+
+// A finding about suspicious trading (hedging between accounts, copy trading, latency abuse) waiting for a staff decision.
+model AbuseFlag {
+  id                String          @id @default(uuid()) @db.Uuid
+  type              AbuseFlagType
+  status            AbuseFlagStatus @default(OPEN)
+  accountId         String          @db.Uuid
+  account           TradingAccount  @relation(fields: [accountId], references: [id])
+  relatedAccountIds String[]        @default([])
+  summary           String
+  evidence          Json
+  // Same finding twice = same key (a scan or a retry never creates a duplicate)
+  dedupeKey         String          @unique
+  reviewedById      String?         @db.Uuid
+  reviewedAt        DateTime?
+  reviewNote        String?
+  createdAt         DateTime        @default(now())
+
+  @@index([status, createdAt])
+  @@index([accountId])
+}
+
+// Request of a trader to review a breach (inaccurate data, outage, duplicate fill, software fault). One per breach event.
+model BreachReview {
+  id             String             @id @default(uuid()) @db.Uuid
+  accountId      String             @db.Uuid
+  account        TradingAccount     @relation(fields: [accountId], references: [id])
+  riskEventId    String             @unique @db.Uuid
+  requestedById  String             @db.Uuid
+  reason         String
+  // Copy of the breach evidence (equity, floors, marks) taken when the review was opened
+  evidence       Json?
+  status         BreachReviewStatus @default(OPEN)
+  deadlineAt     DateTime
+  requestedAt    DateTime           @default(now())
+  resolvedById   String?            @db.Uuid
+  resolvedAt     DateTime?
+  resolutionNote String?
+
+  @@index([status, requestedAt])
+  @@index([accountId])
 }
 
 // ------------------------------ Funding ------------------------------

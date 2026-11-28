@@ -1,6 +1,7 @@
 import Decimal from 'decimal.js';
 import { describe, expect, it } from 'vitest';
-import { fundingCashflow, initialMargin, maintenanceMarginRef, scaleMarginOnReduce } from '../src/modules/trading/engine/calculations';
+import { fundingCashflow, initialMargin, scaleMarginOnReduce } from '../src/modules/trading/engine/calculations';
+import { maintenanceMargin } from '../src/modules/trading/engine/market-policy';
 import { checkNewExposure, computeMetrics, isOverCap, symbolSideNotional, type Leg } from '../src/modules/trading/engine/exposure';
 
 const d = (v: Decimal.Value) => new Decimal(v);
@@ -11,14 +12,17 @@ const leg = (over: Partial<Leg> = {}): Leg => ({
   entryPrice: d(90000),
   mark: d(90000),
   margin: d(2000),
+  maxLeverage: 10,
   ...over,
 });
 
 describe('margin formulas', () => {
-  it('initial margin is notional / leverage and MMR is half of it (reference only)', () => {
+  it('initial margin is notional / leverage, maintenance margin is notional x 0.5 / symbol max leverage', () => {
     expect(initialMargin(d(20000), 10).toString()).toBe('2000');
     expect(initialMargin(d(20000), 5).toString()).toBe('4000');
-    expect(maintenanceMarginRef(d(2000)).toString()).toBe('1000');
+    expect(maintenanceMargin(d(10000), 10).toString()).toBe('500');
+    expect(maintenanceMargin(d(10000), 5).toString()).toBe('1000');
+    expect(maintenanceMargin(d(10000), 2).toString()).toBe('2500');
   });
 
   it('margin shrinks in proportion when a position is reduced', () => {
@@ -28,7 +32,7 @@ describe('margin formulas', () => {
 });
 
 describe('account metrics (cross margin)', () => {
-  it('available margin = equity - initial margin - reserved (spec fixture)', () => {
+  it('new-entry capacity = min(balance, equity) - used margin - pending margin', () => {
     // equity 10,000 = balance 10,000 with no floating PnL, IM 2,000, reserved 1,000
     const m = computeMetrics(
       d(10000),
@@ -37,7 +41,18 @@ describe('account metrics (cross margin)', () => {
     );
     expect(m.equity.toString()).toBe('10000');
     expect(m.availableMargin.toString()).toBe('7000');
-    expect(m.maintenanceMarginRef.toString()).toBe('1000');
+    // 1 BTC at 90,000 with max leverage 10x: 90,000 x 0.5 / 10
+    expect(m.maintenanceMargin.toString()).toBe('4500');
+  });
+
+  it('floating gains never increase the new-entry capacity, floating losses reduce it', () => {
+    const gain = computeMetrics(d(10000), [leg({ mark: d(91000) })]);
+    expect(gain.equity.toString()).toBe('11000');
+    expect(gain.availableMargin.toString()).toBe('8000'); // 10,000 - 2,000 (not 9,000)
+    expect(gain.freeMargin.toString()).toBe('9000'); // classic free margin may include the gain (display only)
+    const loss = computeMetrics(d(10000), [leg({ mark: d(89000) })]);
+    expect(loss.equity.toString()).toBe('9000');
+    expect(loss.availableMargin.toString()).toBe('7000');
   });
 
   it('floating PnL moves equity but not the balance', () => {

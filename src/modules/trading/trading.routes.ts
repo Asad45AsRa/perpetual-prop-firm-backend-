@@ -1,6 +1,7 @@
 import type { FastifyInstance } from 'fastify';
 import { z } from 'zod';
 import { requirePortal } from '../../middleware/auth';
+import { ApiError } from '../../utils/api-error';
 import { Decimal } from '../../utils/decimal';
 import { parse } from '../../utils/validate';
 import { EXPIRY_CHOICES, expiryToDate } from './engine/market-policy';
@@ -72,6 +73,31 @@ export async function tradingRoutes(app: FastifyInstance) {
 
   app.get('/accounts', async (req) => service.listMyAccounts(req.user!.id));
 
+  // Risk and breach history of the account, newest first (cursor = nextBefore of the previous page)
+  app.get('/accounts/:accountId/risk-events', async (req) => {
+    const { accountId } = parse(accountParams, req.params);
+    const q = parse(z.object({ limit: z.coerce.number().int().min(1).max(100).default(25), before: z.string().datetime().optional() }), req.query);
+    return service.getAccountRiskEvents(req.user!.id, accountId, { limit: q.limit, before: q.before ? new Date(q.before) : undefined });
+  });
+
+  // Technical breach review (72 hours after a breach)
+  app.post('/accounts/:accountId/breach-review', async (req, reply) => {
+    const { accountId } = parse(accountParams, req.params);
+    const body = parse(z.object({ reason: z.string().trim().min(10).max(2000) }), req.body);
+    return reply.status(201).send(await service.requestAccountBreachReview(req.user!.id, accountId, body.reason));
+  });
+
+  app.get('/accounts/:accountId/breach-review', async (req) => {
+    const { accountId } = parse(accountParams, req.params);
+    return service.getAccountBreachReview(req.user!.id, accountId);
+  });
+
+  // Live risk view: equity, daily / static floors and room, profit target progress, exposure, margin and trading results
+  app.get('/accounts/:accountId/risk', async (req) => {
+    const { accountId } = parse(accountParams, req.params);
+    return service.getAccountRisk(req.user!.id, accountId);
+  });
+
   app.get('/accounts/:accountId', async (req) => {
     const { accountId } = parse(accountParams, req.params);
     return service.getAccountOverview(req.user!.id, accountId);
@@ -82,9 +108,13 @@ export async function tradingRoutes(app: FastifyInstance) {
   app.post('/accounts/:accountId/orders', writeLimit, async (req, reply) => {
     const { accountId } = parse(accountParams, req.params);
     const body = parse(orderSchema, req.body);
-    // The standard Idempotency-Key header works like clientOrderId
+    // The standard Idempotency-Key header works like clientOrderId. A key is REQUIRED (spec: every mutating order call carries a
+    // client idempotency key), so a double click or a network retry can never execute twice.
     const header = req.headers['idempotency-key'];
-    const clientOrderId = body.clientOrderId ?? (typeof header === 'string' && header.length <= 64 ? header : undefined);
+    const clientOrderId = body.clientOrderId ?? (typeof header === 'string' && header.length > 0 && header.length <= 64 ? header : undefined);
+    if (!clientOrderId) {
+      throw new ApiError(400, 'IDEMPOTENCY_KEY_REQUIRED', 'Send an Idempotency-Key header (1 to 64 characters) or clientOrderId with every order');
+    }
 
     const result = await service.placeOrder(req.user!.id, {
       accountId,
@@ -168,9 +198,12 @@ export async function tradingRoutes(app: FastifyInstance) {
     const { accountId } = parse(accountParams, req.params);
     const { symbol } = req.params as { symbol: string };
     const body = parse(closeSchema, req.body ?? {});
+    // Optional Idempotency-Key: a retried partial close is answered with the first result instead of closing twice
+    const header = req.headers['idempotency-key'];
     return service.closePosition(req.user!.id, accountId, symbol, {
       size: body.size ? new Decimal(body.size) : undefined,
       positionSide: body.positionSide,
+      clientOrderId: typeof header === 'string' && header.length > 0 && header.length <= 64 ? header : undefined,
     });
   });
 
@@ -200,3 +233,4 @@ export async function tradingRoutes(app: FastifyInstance) {
     return service.listLedger(req.user!.id, accountId);
   });
 }
+
